@@ -1,0 +1,3 @@
+# Preserve release bytes so SHA256SUMS works across Windows and Linux checkouts.
+* -text
+*.png binary
