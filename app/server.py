@@ -156,7 +156,7 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.0"}
+        return {"token": token, "instance": instance, "version": "0.1.1"}
 
     @app.get("/api/state")
     def state():

@@ -31,7 +31,7 @@ def main():
         sock.bind(("127.0.0.1", args.port))
         sock.listen(128)
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        print(f"KGI US Grid Web 0.1.0: {url}", flush=True)
+        print(f"KGI US Grid Web 0.1.1: {url}", flush=True)
 
         def open_browser():
             deadline = time.monotonic() + 30

@@ -187,8 +187,10 @@ function renderConnection(){
  $("login-stage").textContent=(c.message||titles[phase]||phase)+wait;
  const accountPhase=["select_account","selecting_account"].includes(phase),sessionPhase=!accountPhase&&!["logged_out","login_failed","logging_in"].includes(phase);
  $("login-form").hidden=accountPhase||sessionPhase;$("account-step").hidden=!accountPhase;$("connected-step").hidden=!sessionPhase;
- $("login-form").querySelector("button").disabled=loginPending||phase==="logging_in";
- $("login-form").querySelector("button").textContent=loginPending||phase==="logging_in"?"登入中…":"登入凱基";
+ const loginBusy=loginPending||phase==="logging_in",loginForm=$("login-form");
+ loginForm.querySelectorAll("input,button[type=submit]").forEach(control=>{control.disabled=loginBusy;});
+ loginForm.setAttribute("aria-busy",String(loginBusy));
+ loginForm.querySelector("button").textContent=loginBusy?"登入中…":"登入凱基";
  $("connected-account").textContent=c.selected?`${c.selected.broker_id} · ${c.selected.account}`:"會話尚未選帳，請查看連線狀態";
  $("login-phase-title").textContent=accountPhase?"登入成功 → 選擇帳戶":sessionPhase?"連線狀態與 SDK 輸出":"登入即時輸出";
  for(const [id,active]of [["step-login",!accountPhase&&!sessionPhase],["step-account",accountPhase],["step-ready",sessionPhase]])$(id).classList.toggle("current",active);
