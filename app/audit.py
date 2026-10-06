@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
+import errno
 import hashlib
 import inspect
 from importlib.metadata import version, PackageNotFoundError
@@ -21,6 +22,10 @@ import uuid
 
 COMMAND = ContextVar("command_id", default=None)
 CALL = ContextVar("call_id", default=None)
+
+
+class AuditUnavailable(ValueError):
+    """No new brokerage effect may pass an incomplete audit checkpoint."""
 
 
 def broker_reference(org, order_id):
@@ -103,6 +108,19 @@ class Audit:
         self.lines = deque(maxlen=300)
         self.redactor = Redactor()
         self.error = None
+        self._clock = time.monotonic
+        self._pending = deque()
+        self._pending_bytes = 0
+        self.max_pending_records = 2000
+        self.max_pending_bytes = 8 * 1024 * 1024
+        self._missing_records = 0
+        self._missing_first = None
+        self._missing_last = None
+        self._write_failure = None
+        self._retry_due = 0.0
+        self._retry_delay = 1.0
+        self._retry_attempt = 0
+        self._partial_tail = False
         self.connection = {
             "phase": "logged_out",
             "production": False,
@@ -149,32 +167,140 @@ class Audit:
             return value
         return self.redactor.text(value)
 
+    def _record(self, event, data):
+        self.seq += 1
+        return {
+            "schema": 1,
+            "time": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "seq": self.seq,
+            "event": event,
+            "command_id": COMMAND.get(),
+            "call_id": CALL.get(),
+            **self.clean(data),
+        }
+
+    def _enqueue(self, row):
+        encoded = (json.dumps(row, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+        if (
+            len(self._pending) >= self.max_pending_records
+            or self._pending_bytes + len(encoded) > self.max_pending_bytes
+        ):
+            self._missing_records += 1
+            self._missing_first = self._missing_first or row["seq"]
+            self._missing_last = row["seq"]
+            self.error = "稽核緩衝已滿，存在紀錄缺漏；停止新增實單，請保存紀錄並查核"
+            return False
+        self._pending.append((row, encoded))
+        self._pending_bytes += len(encoded)
+        return True
+
+    def _write_failed(self, exc, now):
+        winerror = getattr(exc, "winerror", None)
+        reason = (
+            "檔案暫被其他程序使用"
+            if winerror in (32, 33)
+            else "磁碟空間不足"
+            if exc.errno == errno.ENOSPC or winerror == 112
+            else "檔案寫入被拒絕（可能被佔用或權限不足）"
+            if exc.errno in (errno.EACCES, errno.EPERM) or winerror == 5
+            else "儲存裝置寫入異常"
+        )
+        # Native exception strings may contain private paths; retain codes, not the payload.
+        self._write_failure = {
+            "error_type": type(exc).__name__,
+            "errno": exc.errno,
+            "winerror": winerror,
+            "reason": reason,
+        }
+        self._retry_attempt += 1
+        self._retry_due = now + self._retry_delay
+        self._retry_delay = min(30.0, self._retry_delay * 2)
+        if not self._missing_records:
+            self.error = "稽核寫入暫不可用；停止新增實單並自動重試，監控與委託查核持續"
+
+    def _drain(self, now, durable=False):
+        try:
+            with self.path.open("a+b") as file:
+                while self._pending:
+                    row, encoded = self._pending[0]
+                    file.seek(0, 2)
+                    end = file.tell()
+                    # Flush/fsync may have failed after the complete row was appended.
+                    # Do not append that same (run_id, seq) a second time.
+                    file.seek(max(0, end - len(encoded)))
+                    already_appended = end >= len(encoded) and file.read() == encoded
+                    if not already_appended:
+                        if end:
+                            file.seek(end - 1)
+                            if file.read(1) != b"\n":
+                                file.write(b"\n")
+                                self._partial_tail = True
+                        file.write(encoded)
+                    file.flush()
+                    if durable or row["event"] in ("effect_dispatch", "command_received"):
+                        os.fsync(file.fileno())
+                    self._pending.popleft()
+                    self._pending_bytes -= len(encoded)
+            return True
+        except OSError as exc:
+            self._write_failed(exc, now)
+            return False
+
+    def retry_pending(self, now=None):
+        """Retry only audit records, never SDK operations, with a 1..30 second backoff."""
+        with self.lock:
+            if not self.error:
+                return True
+            if self._write_failure is None:
+                return False
+            now = self._clock() if now is None else now
+            if now < self._retry_due:
+                return False
+            pending = len(self._pending)
+            if not self._drain(now, durable=True):
+                return False
+            event = "audit_gap_checkpoint" if self._missing_records else "audit_recovered"
+            self._enqueue(
+                self._record(
+                    event,
+                    {
+                        **self._write_failure,
+                        "attempt": self._retry_attempt,
+                        "buffered_records": pending,
+                        "partial_tail_preserved": self._partial_tail,
+                        "missing_records": self._missing_records,
+                        "missing_seq_first": self._missing_first,
+                        "missing_seq_last": self._missing_last,
+                    },
+                )
+            )
+            if not self._drain(now, durable=True):
+                return False
+            if self._missing_records:
+                self._retry_due = now + 30
+                return False  # Successful storage cannot undo evidence that was dropped.
+            self.error = None
+            self._write_failure = None
+            self._retry_attempt = 0
+            self._retry_due = 0.0
+            self._retry_delay = 1.0
+            self._partial_tail = False
+            return True
+
     def emit(self, event, **data):
         with self.lock:
-            self.seq += 1
-            row = {
-                "schema": 1,
-                "time": datetime.now(timezone.utc).isoformat(),
-                "run_id": self.run_id,
-                "seq": self.seq,
-                "event": event,
-                "command_id": COMMAND.get(),
-                "call_id": CALL.get(),
-                **self.clean(data),
-            }
-            try:
-                with self.path.open("a", encoding="utf-8") as file:
-                    file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-                    file.flush()
-                    if event in ("effect_dispatch", "command_received"):
-                        os.fsync(file.fileno())
-            except OSError:
-                self.error = "稽核紀錄無法寫入；停止新增實單，已送出的結果仍須查核"
+            row = self._record(event, data)
+            self._enqueue(row)
+            if self.error:
+                self.retry_pending()
+            else:
+                self._drain(self._clock())
             return row
 
     def require_writable(self):
         if self.error:
-            raise ValueError(self.error)
+            raise AuditUnavailable(self.error)
 
     def screen(self, text):
         with self.lock:
@@ -198,7 +324,20 @@ class Audit:
                 "lines": list(self.lines),
                 "connection": dict(self.connection),
                 "error": self.error,
+                "writer": {
+                    **(self._write_failure or {}),
+                    "pending_records": len(self._pending),
+                    "pending_bytes": self._pending_bytes,
+                    "missing_records": self._missing_records,
+                    "attempt": self._retry_attempt,
+                    "retry_in_seconds": max(0, self._retry_due - self._clock()) if self.error else None,
+                    "recoverable": bool(self._write_failure) and not self._missing_records,
+                },
             }
+
+    def status(self):
+        with self.lock:
+            return {"seq": self.seq, "error": self.error}
 
     @contextmanager
     def call(self, name, **parameters):

@@ -7,6 +7,98 @@ function Get-GridRuntime([string]$Runtime) {
     return Join-Path $env:LOCALAPPDATA 'KGI_US_Grid_Trading_Web\runtime'
 }
 
+function Get-GridRuntimeId([string]$Runtime) {
+    $normalized = (Get-GridRuntime $Runtime).Replace('/', '\')
+    if ($normalized.Length -gt 3) { $normalized = $normalized.TrimEnd('\') }
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($normalized.ToLowerInvariant())
+        return ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    } finally { $hash.Dispose() }
+}
+
+function Invoke-GridStartupProbe([string]$Url) {
+    # A bounded, read-only loopback request; never follow a redirect or a proxy.
+    Add-Type -AssemblyName System.Net.Http
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $false
+    $handler.UseProxy = $false
+    $client = New-Object Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(2)
+    $client.MaxResponseContentBufferSize = 65536
+    try { return $client.GetStringAsync($Url).GetAwaiter().GetResult() }
+    catch { return $null }
+    finally { $client.Dispose() }
+}
+
+function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
+    $url = "http://127.0.0.1:$Port/"
+    try {
+        $healthText = Invoke-GridStartupProbe ($url + 'api/health')
+        $health = if ($healthText) { $healthText | ConvertFrom-Json } else { $null }
+        if ($health -and $health.product) {
+            # A modern identity mismatch is conclusive; do not downgrade to legacy matching.
+            if ($health.product -ne 'kgi-us-grid-web' -or $health.protocol -ne 1 -or
+                $health.ready -ne $true -or $health.runtime_id -ne (Get-GridRuntimeId $Runtime) -or
+                [string]$health.instance -notmatch '^[a-f0-9]{32}$' -or [int]$health.pid -le 0) { return $null }
+            return @{ url = $url; backend_pid = [int]$health.pid; instance = [string]$health.instance; identity = 'health' }
+        }
+        # Older running releases cannot acquire a new endpoint without a restart.
+        # Bind their HTTP surface to this launch.pyw and the selected runtime's
+        # own startup record, including process creation time to reject stale PIDs.
+        $sessionText = Invoke-GridStartupProbe ($url + 'api/session')
+        if (-not $sessionText) { return $null }
+        $session = $sessionText | ConvertFrom-Json
+        if (-not $session -or [string]$session.instance -notmatch '^[a-f0-9]{32}$' -or
+            [string]$session.version -notmatch '^\d+\.\d+\.\d+') { return $null }
+        $page = Invoke-GridStartupProbe $url
+        if (-not $page -or $page -notmatch '<title>KGI 美股網格工作台</title>') { return $null }
+        $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        if ($listeners.Count -ne 1) { return $null }
+        $backendPid = [int]$listeners[0].OwningProcess
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$backendPid" -OperationTimeoutSec 2
+        $entry = [regex]::Escape((Join-Path $PSScriptRoot 'launch.pyw'))
+        if (-not $process -or $process.CommandLine -notmatch ($entry + '(?="|\s|$)')) { return $null }
+        $runtimeArgument = [regex]::Match($process.CommandLine, '(?:^|\s)"?--runtime"?\s+(?:"([^"]+)"|(\S+))')
+        if ($runtimeArgument.Success) {
+            $argument = $runtimeArgument.Groups[1].Value
+            if (-not $argument) { $argument = $runtimeArgument.Groups[2].Value }
+            if ((Get-GridRuntimeId $argument) -ne (Get-GridRuntimeId $Runtime)) { return $null }
+        }
+        $log = Join-Path (Split-Path -Parent (Get-GridRuntime $Runtime)) 'logs\bootstrap.jsonl'
+        if (-not (Test-Path -LiteralPath $log)) { return $null }
+        $started = $process.CreationDate.ToUniversalTime()
+        foreach ($line in (Get-Content -LiteralPath $log -Encoding UTF8 -Tail 120)) {
+            try { $record = $line.TrimStart([char]0xfeff) | ConvertFrom-Json } catch { continue }
+            if ($record.event -ne 'launcher_started' -or [int]$record.pid -ne $backendPid) { continue }
+            $at = [DateTimeOffset]::Parse([string]$record.at).UtcDateTime
+            if ($at -lt $started -or ($at - $started).TotalSeconds -gt 120) { continue }
+            return @{ url = $url; backend_pid = $backendPid; instance = [string]$session.instance; identity = 'legacy_process' }
+        }
+    } catch { return $null }
+    return $null
+}
+
+function Open-ExistingGridWorkbench([hashtable]$Existing, [string]$Runtime = '', [switch]$NoBrowser) {
+    $logs = Join-Path (Split-Path -Parent (Get-GridRuntime $Runtime)) 'logs'
+    New-Item -ItemType Directory -Path $logs -Force | Out-Null
+    $script:SetupLog = Join-Path $logs 'bootstrap.jsonl'
+    $script:SetupStage = 'open_existing'
+    try {
+        # The browser is the requested visible UI; no new backend or console is launched.
+        if (-not $NoBrowser) { Start-Process -FilePath $Existing.url }
+    } catch {
+        $script:SetupDetail = "工作台仍在運行；瀏覽器未能自動開啟，請手動開啟 $($Existing.url)"
+        Write-SetupEvent $script:SetupLog 'workbench_browser_failed' @{ port = ([uri]$Existing.url).Port; backend_pid = $Existing.backend_pid }
+        throw
+    }
+    Write-SetupEvent $script:SetupLog 'workbench_reused' @{
+        port = ([uri]$Existing.url).Port; backend_pid = $Existing.backend_pid
+        instance = $Existing.instance; identity = $Existing.identity; browser_opened = (-not [bool]$NoBrowser)
+    }
+    if ($NoBrowser) { Write-Host "工作台已在運行：$($Existing.url)" }
+}
+
 function Write-SetupEvent([string]$Log, [string]$Event, [hashtable]$Fields = @{}) {
     $record = @{ at = (Get-Date).ToUniversalTime().ToString('o'); event = $Event }
     foreach ($key in $Fields.Keys) { $record[$key] = $Fields[$key] }
@@ -301,6 +393,9 @@ function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switc
 
 function Show-SetupFailure([switch]$NoUI) {
     $message = "環境準備或啟動未完成（階段：$script:SetupStage）。`n$script:SetupDetail`n可執行 start 重新檢查；需要重裝套件時用 install.vbs -Repair。`n紀錄：$script:SetupLog"
+    if ($script:SetupStage -eq 'open_existing') {
+        $message = "$script:SetupDetail`n既有程序、登入與交易監控仍保持運行。`n紀錄：$script:SetupLog"
+    }
     if ($NoUI) { Write-Host $message; return }
     Add-Type -AssemblyName System.Windows.Forms
     [Windows.Forms.MessageBox]::Show($message, 'KGI 美股網格工作台', 'OK', 'Error') | Out-Null

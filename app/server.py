@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import date
+import hashlib
 from io import BytesIO
 import os
 from pathlib import Path
@@ -52,6 +53,11 @@ ACTIONS = {
 def runtime_path():
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
     return Path(os.environ.get("KGI_GRID_RUNTIME", base / "KGI_US_Grid_Trading_Web" / "runtime"))
+
+
+def runtime_identity(directory):
+    normalized = os.path.normcase(os.path.abspath(directory))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class RuntimeLock:
@@ -111,7 +117,7 @@ def create_app(path=None, service_factory=Service):
                 service.close()
             finally:
                 # A blocked actor must retain custody of its DB lock until process exit.
-                if not service.thread.is_alive():
+                if not service.thread.is_alive() and service.cleanup_complete.is_set():
                     guard.release()
 
     app = FastAPI(
@@ -157,7 +163,20 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.2"}
+        return {"token": token, "instance": instance, "version": "0.1.3"}
+
+    @app.get("/api/health")
+    def health():
+        # Startup identity only; no credentials, account data or actor commands.
+        return {
+            "product": "kgi-us-grid-web",
+            "protocol": 1,
+            "instance": instance,
+            "version": "0.1.3",
+            "pid": os.getpid(),
+            "runtime_id": runtime_identity(directory),
+            "ready": service.thread.is_alive() and not service.stop_event.is_set(),
+        }
 
     @app.get("/api/state")
     def state():

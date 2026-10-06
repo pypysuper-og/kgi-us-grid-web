@@ -4,6 +4,7 @@ const modeNames={demo:"離線展示",paper:"行情模擬",live:"正式交易"};
 const stateNames={active:"監控中",paused:"已暫停",archived:"已封存",prepared:"準備送單",awaiting_report:"等待回報",working:"委託中",partially_filled:"部分成交",filled:"全部成交",canceled:"已撤銷",rejected:"被拒",expired:"已失效",unknown:"結果未明"};
 let diagnostics=null,diagnosticBusy=false,loginPending=false,selectionPending=false,shutdownPending=false;
 let token="",state=null,selected=null,tab="plan",editing=null,closed=false,pollBusy=false;
+let backendError="";
 const reportSelection=new Map();
 const terminal=new Set(["filled","canceled","rejected","expired"]);
 function el(tag,text,className){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(className)n.className=className;return n;}
@@ -11,6 +12,14 @@ function button(text,fn,cls="secondary"){const n=el("button",text,cls);n.type="b
 function number(value,digits=2){return value===null||value===undefined?"未知":Number(value).toLocaleString("zh-TW",{maximumFractionDigits:digits});}
 function timeLabel(value){if(!value)return "未知";return new Date(value).toLocaleString("zh-TW",{hour12:false});}
 function toast(text){$("toast").textContent=text;$("toast").hidden=false;setTimeout(()=>$("toast").hidden=true,4500);}
+function renderNotice(){
+ const newerState=state?.audit_seq!==undefined&&(!diagnostics||state.audit_seq>diagnostics.seq);
+ const error=newerState?state.audit_error:diagnostics?diagnostics.error:state?.audit_error;
+ const w=newerState?{}:diagnostics?.writer||{},code=w.winerror?`Windows ${w.winerror}`:w.errno?`errno ${w.errno}`:"";
+ const auditError=error?[error,w.reason,code,w.attempt?`已重試 ${w.attempt} 次`:""].filter(Boolean).join(" · "):"";
+ const text=backendError||state?.fault||auditError||[state?.live_reason,state?.stage?.includes("重連")?state.stage:""].filter(Boolean).join(" · ");
+ if($("notice").textContent!==text)$("notice").textContent=text;
+}
 async function request(url,options={}){let response;try{response=await fetch(url,{...options,headers:{"Content-Type":"application/json","X-Grid-Token":token,...options.headers}});}catch{throw Error("後端連線中斷；請查核狀態，不要重送交易");}if(!response.ok){const data=await response.json().catch(()=>({}));throw Error(typeof data.detail==="string"?data.detail:"輸入或操作不符合條件");}return response.json();}
 async function command(action,payload={}){
  const id=crypto.randomUUID();await request(`/api/commands/${action}`,{method:"POST",body:JSON.stringify({request_id:id,payload})});
@@ -110,8 +119,8 @@ function renderPnl(body,s,p){
 }
 function openingDialog(s){const body=el("div"),amount=el("input"),reason=el("input");body.append(el("p",`請核對期初 ${s.params.initial_inventory} 股的總成本（USD），不是目前剩餘持股成本。更正以追加記錄保存並重算歷史。`));amount.type="number";amount.min="0";amount.step=".01";amount.setAttribute("aria-label","期初總成本 USD");reason.placeholder="成本來源／更正原因";reason.setAttribute("aria-label","成本來源");body.append(amount,reason);actionDialog("核對期初成本",body,[{text:"保存成本",cls:"primary",fn:()=>command("opening_cost",{strategy_id:s.id,amount:amount.value,reason:reason.value})}]);}
 function feeDialog(order){const body=el("div");body.append(el("p","輸入此筆委託的累計實際美元費用；更正會追加記錄並重算，不會修改成交股數。"));const amount=el("input");amount.type="number";amount.min="0";amount.step=".01";amount.value="0";amount.setAttribute("aria-label","累計費用 USD");const reason=el("input");reason.placeholder="費用來源／更正原因";reason.setAttribute("aria-label","費用來源");body.append(amount,reason);actionDialog("核對費用",body,[{text:"保存費用",cls:"primary",fn:()=>command("fee",{order_id:order.id,amount:amount.value,reason:reason.value})}]);}
-function render(){if(typeof loadLayout==="function")loadLayout(state.ui_preferences);const live=state.strategies.filter(s=>s.status!=="archived");$("metric-active").textContent=live.filter(s=>s.status==="active").length;$("metric-orders").textContent=state.orders.filter(o=>!terminal.has(o.status)||o.unknown).length;$("metric-holdings").textContent=state.report.rows.reduce((v,r)=>v+r.quantity,0);$("metric-attention").textContent=live.filter(s=>!s.reconciled||s.reason).length;$("notice").textContent=state.fault||[state.live_reason,state.stage?.includes("重連")?state.stage:""].filter(Boolean).join(" · ");$("connection").textContent=state.fault?"需檢查":"本機已連線";$("connection").className="pill"+(state.fault?" bad":"");$("freshness").textContent="最近更新 "+timeLabel(state.updated_at);if(!selected&&live.length)selected=live[0].id;renderStrategies();if(!$("detail").contains(document.activeElement)){const top=$("detail").scrollTop;renderDetail();$("detail").scrollTop=top;}renderAccounts();renderEditorMarket();}
-async function refresh(){if(pollBusy||closed)return;pollBusy=true;try{state=await request("/api/state");render();}catch(e){$("connection").textContent="後端失聯";$("connection").className="pill bad";$("notice").textContent=e.message;if(state){renderStrategies();renderEditorMarket();}}finally{pollBusy=false;}}
+function render(){if(typeof loadLayout==="function")loadLayout(state.ui_preferences);const live=state.strategies.filter(s=>s.status!=="archived");$("metric-active").textContent=live.filter(s=>s.status==="active").length;$("metric-orders").textContent=state.orders.filter(o=>!terminal.has(o.status)||o.unknown).length;$("metric-holdings").textContent=state.report.rows.reduce((v,r)=>v+r.quantity,0);$("metric-attention").textContent=live.filter(s=>!s.reconciled||s.reason).length;renderNotice();$("connection").textContent=state.fault?"需檢查":"本機已連線";$("connection").className="pill"+(state.fault?" bad":"");$("freshness").textContent="最近更新 "+timeLabel(state.updated_at);if(!selected&&live.length)selected=live[0].id;renderStrategies();if(!$("detail").contains(document.activeElement)){const top=$("detail").scrollTop;renderDetail();$("detail").scrollTop=top;}renderAccounts();renderEditorMarket();}
+async function refresh(){if(pollBusy||closed)return;pollBusy=true;try{state=await request("/api/state");backendError="";render();}catch(e){$("connection").textContent="後端失聯";$("connection").className="pill bad";backendError=e.message;renderNotice();if(state){renderStrategies();renderEditorMarket();}}finally{pollBusy=false;}}
 const HELP={
  orderLimit:["送單筆數限制",["這是本程式的實單操作額度，不是券商規則、股數、格數或成交次數。所有正式策略共用；買單與賣單每次進入送單流程各計1筆。查詢、撤單、離線與行情模擬不計。","已嘗試送單即佔用額度；被拒、結果未明或之後撤銷也不退回。重新送出新委託另計1筆。買1筆再賣1筆，共2筆。","填20並啟用，表示從現在起最多再嘗試20筆；重新設定會將剩餘額度改為20，不是加在原本剩餘額度上。這不是每日自動重置的限制。","用完後，下一次觸發新單的策略會暫停，已送出的委託仍會追蹤，不會自動撤單或平倉。需重新設定額度並啟動暫停策略；本次設定不會自動啟動策略。","每日買入金額、持股與單筆金額上限仍分別生效。程式重啟後不沿用實單授權，需重新確認。"]],
  overview:["工作台怎麼用",["按「新增網格」自行選擇模式，可用逐步精靈完成參數與預覽，再另行啟動。所有策略都需要另按啟動，儲存不會執行交易。","桌面左側是策略與設定，右側用分頁查看規劃、委託、成交、成本與事件。窄畫面用「策略與設定／規劃與紀錄」切換。主畫面固定，長資料在區塊內捲動。","上方「離線行情」開啟測試小視窗；各區旁的「？」可隨時查看操作說明。關閉說明只關閉視窗。","關閉瀏覽器不會停止後端。離開前請停止策略，或用「結束程式」選擇未成交單的處理方式。"]],
@@ -199,7 +208,7 @@ function renderConnection(){
  $("account-selector").querySelectorAll("button").forEach(b=>b.disabled=selectionPending||phase==="selecting_account");
  $("reconnect").disabled=["logged_out","login_failed","logging_in","logging_out","logout_failed","selecting_account","reconnecting"].includes(phase);
  $("logout").disabled=["logged_out","logging_in","logging_out"].includes(phase);
- if(diagnostics?.error)$("notice").textContent=diagnostics.error;
+ renderNotice();
 }
 async function pollDiagnostics(){
  if(diagnosticBusy||closed||shutdownPending)return;diagnosticBusy=true;
@@ -209,7 +218,7 @@ async function shutdown(cancel){
  if(shutdownPending)return;shutdownPending=true;$("action-dialog").close();$("shutdown-screen").hidden=false;$("shutdown-back").hidden=true;document.querySelector(".shutdown-symbol").textContent="…";$("shutdown-title").textContent="正在結束程式";$("shutdown-message").textContent="停止策略並確認券商登出中…";
  showShutdownOrders([]);
  try{const result=await command("shutdown",{cancel});showShutdownOrders(result.unresolved_orders||[]);if(!result.shutdown||!result.logout_confirmed)throw Error("尚未取得登出與結束確認");closed=true;$("shutdown-message").textContent="已確認登出，等待後端結束…";
-  for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,500));try{await fetch("/api/session",{signal:AbortSignal.timeout(1500)});}catch(e){if(e.name==="TimeoutError")continue;document.querySelector(".shutdown-symbol").textContent="✓";$("shutdown-title").textContent="程式已結束";$("shutdown-message").textContent="可以關閉視窗";$("shutdown-detail").textContent="券商已登出，帳本與稽核紀錄已保存。下方未確認委託請另至券商查核；仍有效的委託可能繼續成交。";return;}}
+  for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,500));try{await fetch("/api/session",{signal:AbortSignal.timeout(1500)});}catch(e){if(e.name==="TimeoutError")continue;$("shutdown-message").textContent="網頁服務已停止，等待背景程序釋放環境鎖…";await new Promise(r=>setTimeout(r,3500));document.querySelector(".shutdown-symbol").textContent="✓";$("shutdown-title").textContent="程式已結束";$("shutdown-message").textContent="可以關閉視窗";$("shutdown-detail").textContent="券商已登出，帳本與稽核紀錄已保存。下方未確認委託請另至券商查核；仍有效的委託可能繼續成交。";return;}}
   throw Error("已確認登出，但尚未確認後端結束，請查看執行視窗。");
  }catch(e){document.querySelector(".shutdown-symbol").textContent="!";$("shutdown-title").textContent="尚未確認程式結束";$("shutdown-message").textContent=e.message;$("shutdown-detail").textContent="請返回工作台核對狀態，勿直接假定已登出或重送交易。";$("shutdown-back").hidden=false;closed=false;}finally{shutdownPending=false;}
 }

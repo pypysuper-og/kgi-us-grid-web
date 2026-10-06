@@ -29,12 +29,13 @@ from .models import (
 from .market import MarketWatch
 from .storage import Store, encode
 from .recovery import Recovery, compatible
-from .audit import Audit, COMMAND, observed, broker_reference
+from .audit import Audit, AuditUnavailable, COMMAND, observed, broker_reference
 
 
 class Core:
     def __init__(self, path: Path, broker=None, calendar=None, audit=None):
         self.audit = audit or Audit(path.parent / "logs")
+        self.audit.emit("startup_step", phase="database")
         self.store = Store(path)
         self.store.audit = self.audit
         self.store.recover()
@@ -50,6 +51,7 @@ class Core:
         self.inventory_offsets = {}
         self.session_order_limit = 0
         self.session_order_count = 0
+        self.audit.emit("startup_step", phase="market_calendar")
         self.calendar = calendar or MarketCalendar()
         self.generation = 0
         self.owner = None
@@ -64,11 +66,20 @@ class Core:
         self.closing = False
         self.match_observations = {}
         self.recovery = Recovery(self)
-        for row in self.store.rows("SELECT owner,data FROM broker_snapshots ORDER BY id"):
+        self.audit.emit("startup_step", phase="restore_books")
+        # History is append-only. Restore just the last matching book per owner;
+        # unrelated snapshot kinds must not replace a saved matching book.
+        saved_books = self.store.rows(
+            "SELECT s.owner,s.data FROM broker_snapshots AS s JOIN "
+            "(SELECT owner,MAX(id) AS id FROM broker_snapshots "
+            "WHERE json_type(data,'$.paper_book') IS NOT NULL GROUP BY owner) AS latest "
+            "ON s.id=latest.id ORDER BY s.id"
+        )
+        for row in saved_books:
             data = json.loads(row["data"])
-            if "paper_book" in data:
-                self.books[row["owner"]] = PaperBroker(data["paper_book"])
+            self.books[row["owner"]] = PaperBroker(data["paper_book"])
         self.books.setdefault("demo", PaperBroker())
+        self.audit.emit("startup_step", phase="books_restored", books_loaded=len(saved_books))
 
     def paper(self, owner):
         return self.books.setdefault(owner, PaperBroker())
@@ -368,8 +379,12 @@ class Core:
             return
         self.quote_warning(sid)
         if p.mode != "demo":
-            if row["owner"] != f"{p.mode}:{self.owner}" or self.broker.disconnected.is_set():
+            if row["owner"] != f"{p.mode}:{self.owner}":
                 self.fail(sid, "會話身分或連線已失效")
+                return
+            if self.broker.disconnected.is_set():
+                # Capture active monitoring before pausing; a callback can arrive mid-quote.
+                self.recover_connection()
                 return
             if not self.calendar.is_open(utcnow()):
                 return
@@ -437,7 +452,7 @@ class Core:
             return
         if p.mode != "demo":
             if self.broker.disconnected.is_set():
-                self.fail(sid, "送單前券商連線已失效")
+                self.recover_connection()
                 return
             if not self.calendar.is_open(decision_now):
                 return
@@ -1208,6 +1223,7 @@ class Core:
         return {"shutdown": True, "logout_confirmed": True, "unresolved_orders": unresolved}
 
     def tick(self):
+        self.audit.retry_pending()
         for row in self.store.strategies():
             if (
                 row["status"] == "active"
@@ -1254,13 +1270,28 @@ class Core:
                 for s in active:
                     if s["params"]["symbol"] == symbol:
                         self.on_quote(s["id"], s["revision"], quote)
-            except Exception:
+            except AuditUnavailable:
+                # No intent exists: keep the user's active monitoring and limits.
+                # A prepared/dispatched intent has custody and needs reconciliation.
+                for s in active:
+                    if s["params"]["symbol"] == symbol and self.store.pending(s["id"]):
+                        self.fail(s["id"], "稽核寫入中斷且有未結委託意圖；請查核，不自動重送")
+            except Exception as exc:
                 for s in active:
                     if s["params"]["symbol"] == symbol:
+                        self.audit.emit(
+                            "strategy_tick_error",
+                            strategy_id=s["id"],
+                            phase="quote_evaluation",
+                            error_type=type(exc).__name__,
+                        )
                         self.fail(s["id"], "交易處理失敗；請查核委託與帳本")
 
     def snapshot(self):
+        audit_status = self.audit.status()
         return {
+            "audit_seq": audit_status["seq"],
+            "audit_error": audit_status["error"],
             "ui_preferences": self.store.preferences(),
             "updated_at": utcnow().isoformat(),
             "stage": self.stage,
@@ -1268,7 +1299,9 @@ class Core:
             "owner": self.owner,
             "accounts": self.broker.accounts,
             "selected": self.broker.selected,
-            "live_available": self.live_armed and not self.broker.disconnected.is_set(),
+            "live_available": self.live_armed
+            and not self.broker.disconnected.is_set()
+            and not self.audit.error,
             "live_limits": {
                 "daily_buy_limit": str(self.account_limit) if self.account_limit else None,
                 "orders_used": self.session_order_count,
@@ -1316,7 +1349,9 @@ for _name in [n for n in vars(Core) if n.startswith("cmd_")] + ["on_quote", "syn
 class Service:
     """One actor owns SDK and SQLite. HTTP only reads immutable snapshots."""
 
-    def __init__(self, path, core_factory=Core):
+    DEFAULT_STARTUP_TIMEOUT = 90
+
+    def __init__(self, path, core_factory=Core, startup_timeout=DEFAULT_STARTUP_TIMEOUT):
         self.path = Path(path)
         self.audit = Audit(self.path.parent / "logs")
         self.core_factory = core_factory
@@ -1332,13 +1367,31 @@ class Service:
             "report": {"rows": []},
         }
         self.stop_event = threading.Event()
+        self.cleanup_complete = threading.Event()
         self.ready = threading.Event()
         self.error = None
+        self.startup_timeout = startup_timeout
+        self.startup_failure = None
         self.thread = threading.Thread(target=self.run, name="grid-actor", daemon=True)
 
     def start(self):
+        self.audit.emit("actor_initializing", timeout_seconds=self.startup_timeout)
         self.thread.start()
-        if not self.ready.wait(20) or self.error:
+        if not self.ready.wait(self.startup_timeout):
+            self.startup_failure = {
+                "stage": "actor_initialization",
+                "reason": "timeout",
+                "timeout_seconds": self.startup_timeout,
+            }
+            self.audit.emit("startup_failed", **self.startup_failure)
+            raise TimeoutError("工作台初始化逾時，請查看初始化階段紀錄")
+        if self.error:
+            self.startup_failure = {
+                "stage": "actor_initialization",
+                "reason": "actor_error",
+                "error_type": type(self.error).__name__,
+            }
+            self.audit.emit("startup_failed", **self.startup_failure)
             raise RuntimeError("工作台初始化失敗，請檢查 DB 與環境") from self.error
 
     def submit(self, action, payload, request_id):
@@ -1371,6 +1424,8 @@ class Service:
 
     def run(self):
         core = None
+        shutdown_result = None
+        initialized_at = time.monotonic()
         try:
             core = (
                 Core(self.path, audit=self.audit)
@@ -1381,6 +1436,7 @@ class Service:
             core.broker.audit = self.audit
             core.store.audit = self.audit
             self.state = core.snapshot()
+            self.audit.emit("actor_ready", elapsed_seconds=round(time.monotonic() - initialized_at, 3))
             self.ready.set()
             while not self.stop_event.is_set():
                 try:
@@ -1425,9 +1481,15 @@ class Service:
                     command_state = core.snapshot()
                     with self.lock:
                         self.state = command_state
-                        self.results[cid] = result
+                        if core.closing and result.get("result", {}).get("shutdown"):
+                            # Publish terminal success only after DB/SDK cleanup below.
+                            shutdown_result = (cid, result)
+                        else:
+                            self.results[cid] = result
                         while len(self.results) > 500:
                             self.results.popitem(last=False)
+                    if core.closing:
+                        break  # No queued trading command may run after shutdown.
                 try:
                     if not core.closing:
                         core.tick()
@@ -1447,9 +1509,43 @@ class Service:
             self.audit.emit("actor_failed", error_type=type(exc).__name__)
             self.ready.set()
         finally:
-            if core:
-                core.close()
-            self.audit.emit("actor_stopped")
+            cleanup_ok = False
+            try:
+                if core:
+                    core.close()
+            except BaseException as exc:
+                self.error = exc
+                self.audit.emit("actor_cleanup_failed", error_type=type(exc).__name__)
+            else:
+                # A factory that never returned a Core cannot attest to its partial resources.
+                cleanup_ok = core is not None or self.error is None
+            if shutdown_result:
+                cid, result = shutdown_result
+                if not cleanup_ok:
+                    result = {
+                        "id": cid,
+                        "status": "error",
+                        "message": "登出後的帳本／背景清理尚未完成；請保留資料並查核，不要重送交易",
+                    }
+                while True:
+                    try:
+                        queued_id, action, payload = self.commands.get_nowait()
+                    except queue.Empty:
+                        break
+                    payload.clear()
+                    with self.lock:
+                        self.results[queued_id] = {
+                            "id": queued_id,
+                            "status": "error",
+                            "message": "程式已停止接收操作；此排隊命令未執行",
+                        }
+                    self.audit.emit("command_canceled_by_shutdown", command_id=queued_id, action=action)
+            self.audit.emit("actor_stopped", cleanup_complete=cleanup_ok)
+            if cleanup_ok:
+                self.cleanup_complete.set()
+            if shutdown_result:
+                with self.lock:
+                    self.results[cid] = result
 
     def close(self):
         self.stop_event.set()
