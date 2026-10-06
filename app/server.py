@@ -40,6 +40,7 @@ ACTIONS = {
     "live_control",
     "reconnect",
     "order_diagnostics",
+    "order_evidence",
     "retry_order",
     "recovery_preview",
     "recovery_confirm",
@@ -156,7 +157,7 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.1"}
+        return {"token": token, "instance": instance, "version": "0.1.2"}
 
     @app.get("/api/state")
     def state():

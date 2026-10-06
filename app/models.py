@@ -44,6 +44,7 @@ class StrategyInput(BaseModel):
     currency: Literal["MUT", "TWD"] = "MUT"
     end_date: date
     quote_max_age: int = Field(default=15, ge=1, le=60)
+    pause_buys_below_lower: bool = Field(default=False, strict=True)
 
     @field_validator("name", "symbol")
     @classmethod
@@ -106,6 +107,7 @@ def grid_action(params: StrategyInput, anchor: Decimal, inventory: int, price: D
     if (
         params.direction in ("both", "buy")
         and price <= buy
+        and (not params.pause_buys_below_lower or price >= params.lower_price)
         and params.lower_price <= buy <= params.upper_price
         and inventory + params.quantity <= params.max_inventory
     ):
@@ -120,16 +122,18 @@ def grid_action(params: StrategyInput, anchor: Decimal, inventory: int, price: D
     return None
 
 
-def plan_rows(params: StrategyInput):
+def plan_rows(params: StrategyInput, anchor=None, inventory=None):
+    anchor = params.start_price if anchor is None else anchor
+    inventory = params.initial_inventory if inventory is None else inventory
     rows = []
     for side, sign, cap in (
-        ("sell", 1, params.initial_inventory - params.min_inventory),
-        ("buy", -1, params.max_inventory - params.initial_inventory),
+        ("sell", 1, inventory - params.min_inventory),
+        ("buy", -1, params.max_inventory - inventory),
     ):
         if params.direction not in ("both", side):
             continue
         for level in range(1, min(cap // params.quantity, 500) + 1):
-            price = params.start_price + sign * params.price_gap * level
+            price = anchor + sign * params.price_gap * level
             if not params.lower_price <= price <= params.upper_price:
                 break
             rows.append(
@@ -137,7 +141,7 @@ def plan_rows(params: StrategyInput):
                     "side": side,
                     "price": str(price),
                     "quantity": params.quantity,
-                    "inventory": params.initial_inventory - sign * params.quantity * level,
+                    "inventory": inventory - sign * params.quantity * level,
                 }
             )
     return rows

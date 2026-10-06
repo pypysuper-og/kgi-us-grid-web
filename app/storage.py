@@ -231,7 +231,7 @@ class Store:
             )
             self.event("recovery", "已恢復歷史資料；策略保持暫停，未重播任何委託")
 
-    def prepare(self, sid, side, price):
+    def prepare(self, sid, side, price, decision=None):
         strategy = self.strategy(sid)
         if not strategy or strategy["status"] != "active" or self.pending(sid):
             raise ValueError("策略未執行或仍有未結束委託")
@@ -262,7 +262,48 @@ class Store:
                     params.currency,
                 ),
             )
+            if decision is not None:
+                self.db.execute(
+                    "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
+                    (sid, "order_decision", encode({**decision, "order_id": oid, "request_key": key}), now),
+                )
         return next(o for o in self.orders(sid) if o["id"] == oid)
+
+    def order_evidence(self, oid):
+        rows = self.rows(
+            "SELECT kind,data FROM ledger_entries WHERE kind IN ('order_decision','order_pairing') "
+            "AND json_extract(data,'$.order_id')=? ORDER BY id",
+            (oid,),
+        )
+        evidence = {r["kind"]: json.loads(r["data"]) for r in rows}
+        if "order_pairing" not in evidence:
+            order = self.rows("SELECT strategy_id,created_at FROM orders WHERE id=?", (oid,))
+            legacy = (
+                self.rows(
+                    "SELECT time,message FROM events WHERE strategy_id=? AND kind='recovery_pair' "
+                    "AND instr(message,?)>0 ORDER BY id DESC LIMIT 1",
+                    (order[0]["strategy_id"], oid),
+                )
+                if order
+                else []
+            )
+            if legacy:
+                message = legacy[0]["message"]
+                basis = (
+                    "manual"
+                    if "：manual；" in message
+                    else "identity"
+                    if "：identity；" in message
+                    else "unknown"
+                )
+                evidence["order_pairing"] = {
+                    "order_id": oid,
+                    "basis": basis,
+                    "confirmed_at": legacy[0]["time"],
+                    "local_created_at": order[0]["created_at"],
+                    "provenance": "legacy_event",
+                }
+        return evidence
 
     def mark_dispatch(self, oid):
         with self.transaction():

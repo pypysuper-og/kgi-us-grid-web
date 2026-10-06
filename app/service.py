@@ -28,7 +28,7 @@ from .models import (
 )
 from .market import MarketWatch
 from .storage import Store, encode
-from .recovery import Recovery
+from .recovery import Recovery, compatible
 from .audit import Audit, COMMAND, observed, broker_reference
 
 
@@ -122,9 +122,26 @@ class Core:
             raise ValueError("不支援的操作")
         return method(**payload)
 
-    def cmd_preview(self, params):
+    def cmd_preview(self, params, strategy_id=None, revision=None, reset_anchor=False):
         p = StrategyInput.model_validate(params)
-        return {"rows": plan_rows(p), "price_gap": str(p.price_gap)}
+        anchor, inventory = p.start_price, p.initial_inventory
+        if type(reset_anchor) is not bool:
+            raise ValueError("重設網格基準必須明確選擇")
+        if strategy_id:
+            row, _ = self.params(strategy_id)
+            if row["revision"] != revision:
+                raise ValueError("策略版本已變更，請重新開啟編輯")
+            inventory = self.store.position(strategy_id)["quantity"]
+            if not reset_anchor:
+                anchor = decimal(row["anchor"])
+            if not p.lower_price <= anchor <= p.upper_price:
+                raise ValueError("新價格界線不涵蓋目前網格基準；請調整界線或明確重設基準")
+        return {
+            "rows": plan_rows(p, anchor, inventory),
+            "price_gap": str(p.price_gap),
+            "anchor": str(anchor),
+            "inventory": inventory,
+        }
 
     def cmd_grid_layout(self, draft=False, **values):
         return GridLayout.model_validate(values).calculate(draft=draft)
@@ -146,9 +163,11 @@ class Core:
             self.save_book(owner)
         return {"id": sid}
 
-    def cmd_edit(self, strategy_id, params, revision):
+    def cmd_edit(self, strategy_id, params, revision, reset_anchor=False):
         row, previous = self.params(strategy_id)
         p = StrategyInput.model_validate(params)
+        if type(reset_anchor) is not bool:
+            raise ValueError("重設網格基準必須明確選擇")
         if row["status"] == "active" or self.store.pending(strategy_id) or revision != row["revision"]:
             raise ValueError("請先停止並處理在途單，且使用最新策略版本")
         for key in ("symbol", "mode", "initial_inventory", "initial_cost"):
@@ -157,22 +176,37 @@ class Core:
         qty = self.store.position(strategy_id)["quantity"]
         if not p.min_inventory <= qty <= p.max_inventory:
             raise ValueError("新界線不涵蓋目前部位")
-        currency_only = previous.model_copy(update={"currency": p.currency}) == p
+        anchor = str(p.start_price) if reset_anchor else row["anchor"]
+        if not p.lower_price <= decimal(anchor) <= p.upper_price:
+            raise ValueError("新價格界線不涵蓋目前網格基準；請調整界線或明確重設基準")
         with self.store.transaction():
             self.store.db.execute(
                 "UPDATE strategies SET params=?,revision=revision+1,anchor=?,reason='',reconciled=0 WHERE id=?",
-                (p.model_dump_json(), row["anchor"] if currency_only else str(p.start_price), strategy_id),
+                (p.model_dump_json(), anchor, strategy_id),
             )
             self.store.db.execute(
                 "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
                 (
                     strategy_id,
                     "strategy_config",
-                    encode({"revision": revision + 1, "params": p.model_dump(mode="json")}),
+                    encode(
+                        {
+                            "revision": revision + 1,
+                            "params": p.model_dump(mode="json"),
+                            "anchor_before": row["anchor"],
+                            "anchor_after": anchor,
+                            "reset_anchor": reset_anchor,
+                            "cycle": row["cycle"],
+                        }
+                    ),
                     utcnow().isoformat(),
                 ),
             )
-            self.store.event("strategy_edit", "已更新策略，請重新對帳", strategy_id)
+            self.store.event(
+                "strategy_edit",
+                f"已更新策略；{'明確重設' if reset_anchor else '保留'}網格基準 {anchor}，請重新對帳",
+                strategy_id,
+            )
         self.quotes.pop(strategy_id, None)
         return {"id": strategy_id}
 
@@ -327,6 +361,11 @@ class Core:
         if not quote.fresh(utcnow(), p.quote_max_age):
             self.quote_warning(sid, "行情過期或等待來源更新；保持監控，新行情到達後自動恢復")
             return
+        if p.pause_buys_below_lower and p.direction in ("both", "buy") and quote.price < p.lower_price:
+            self.quote_warning(
+                sid, "行情低於買價下界；不新增買單，保持監控，回到範圍後自動恢復；已送委託不會自動撤銷"
+            )
+            return
         self.quote_warning(sid)
         if p.mode != "demo":
             if row["owner"] != f"{p.mode}:{self.owner}" or self.broker.disconnected.is_set():
@@ -353,6 +392,8 @@ class Core:
         if side == "buy" and spent + price * p.quantity > p.daily_buy_limit:
             self.fail(sid, "超過策略每日買入上限")
             return
+        broker_held, sell_reserved = None, None
+        account_spent, reserved = None, None
         if p.mode == "live":
             self.broker.contract(p.symbol)
             self.audit.require_writable()
@@ -370,6 +411,7 @@ class Core:
                 if held - reserved < p.quantity:
                     self.fail(sid, "券商持股扣除未結賣單後不足；不把持股視為已確認可賣量")
                     return
+                broker_held, sell_reserved = held, reserved
             account_spent = sum(
                 (decimal(r["limit_buy_value"]) for r in report["rows"] if r["owner"] == row["owner"]),
                 decimal(0),
@@ -388,7 +430,67 @@ class Core:
             ):
                 self.fail(sid, "超過帳戶每日買入預算")
                 return
-        order = self.store.prepare(sid, side, price)
+        decision_now = utcnow()
+        # Contract/holding/report calls can block; their return does not keep an old quote fresh.
+        if not quote.fresh(decision_now, p.quote_max_age):
+            self.quote_warning(sid, "送單前查核期間行情已過期；保持監控，等待下一筆有效行情")
+            return
+        if p.mode != "demo":
+            if self.broker.disconnected.is_set():
+                self.fail(sid, "送單前券商連線已失效")
+                return
+            if not self.calendar.is_open(decision_now):
+                return
+        if decision_now.astimezone(ET).date().isoformat() != today:
+            self.quote_warning(sid, "送單前預算日期已切換；保持監控，下一筆行情重新計算預算")
+            return
+        decision = {
+            "schema": 1,
+            "evaluated_at": decision_now.isoformat(),
+            "generation": self.generation,
+            "account_reference": hashlib.sha256(row["owner"].encode()).hexdigest()[:24],
+            "strategy": {
+                "id": sid,
+                "revision": row["revision"],
+                "run_id": row["run_id"],
+                "cycle": row["cycle"],
+                "anchor": row["anchor"],
+                "price_gap": str(p.price_gap),
+                "params": p.model_dump(mode="json", exclude={"name"}),
+            },
+            "quote": quote.model_dump(mode="json"),
+            "position": {
+                "quantity": pos["quantity"],
+                "broker_held": broker_held,
+                "broker_reserved_sells": sell_reserved,
+            },
+            "order": {
+                "symbol": p.symbol,
+                "mode": p.mode,
+                "side": side,
+                "price": str(price),
+                "quantity": p.quantity,
+                "value": str(price * p.quantity),
+                "currency": p.currency,
+            },
+            "checks": {
+                "result": "allowed",
+                "quote_fresh": True,
+                "pending_orders": 0,
+                "session": "offline" if p.mode == "demo" else "XNYS_normal",
+                "budget_day": today,
+                "budget_day_timezone": "America/New_York",
+                "strategy_buy_spent": str(spent),
+                "strategy_daily_limit": str(p.daily_buy_limit),
+                "account_buy_spent": str(account_spent) if account_spent is not None else None,
+                "reserved_buys": str(reserved) if reserved is not None else None,
+                "account_daily_limit": str(self.account_limit) if p.mode == "live" else None,
+                "session_orders_used": self.session_order_count if p.mode == "live" else None,
+                "session_orders_limit": self.session_order_limit if p.mode == "live" else None,
+            },
+        }
+        order = self.store.prepare(sid, side, price, decision)
+        self.audit.emit("order_decision", order_id=order["id"], strategy_id=sid, decision=decision)
         self.audit.emit(
             "effect_prepared",
             order_id=order["id"],
@@ -517,21 +619,72 @@ class Core:
             except (ValueError, sqlite3.IntegrityError):
                 self.fail(order["strategy_id"], "成交累計或成本資料不一致，請對帳")
 
-    def cmd_order_diagnostics(self, strategy_id):
+    def cmd_order_evidence(self, order_id):
+        order = next((o for o in self.store.orders() if o["id"] == order_id), None)
+        if order is None:
+            raise ValueError("找不到委託")
+        evidence = self.store.order_evidence(order_id)
+        return {
+            "order": order,
+            "decision": evidence.get("order_decision"),
+            "pairing": evidence.get("order_pairing"),
+            "note": "決策快照記錄送單當時資料；缺少代表舊版本未留存，不能用目前行情補猜。人工配對不是原始送單的識別證明。",
+        }
+
+    def diagnostics_history(self, strategy_id):
+        rows = self.store.rows(
+            "SELECT id,time,data FROM ledger_entries WHERE strategy_id=? "
+            "AND kind='broker_query' ORDER BY id DESC LIMIT 20",
+            (strategy_id,),
+        )
+        return [
+            {
+                "id": r["id"],
+                "queried_at": r["time"],
+                "available": json.loads(r["data"])["available"],
+                "match_counts": json.loads(r["data"]).get("match_counts", {}),
+            }
+            for r in rows
+        ]
+
+    def cmd_order_diagnostics(self, strategy_id, refresh=True, snapshot_id=None):
         row, p = self.params(strategy_id)
+        if not refresh:
+            saved = self.store.rows(
+                "SELECT data FROM ledger_entries WHERE strategy_id=? "
+                "AND kind='broker_query' AND (? IS NULL OR id=?) ORDER BY id DESC LIMIT 1",
+                (strategy_id, snapshot_id, snapshot_id),
+            )
+            if not saved:
+                raise ValueError("此策略尚無已保存的券商查核；登入後請先查詢")
+            result = json.loads(saved[0]["data"])
+            result["saved"] = True
+            result["snapshot_id"] = snapshot_id
+            result["history"] = self.diagnostics_history(strategy_id)
+            return result
         if p.mode != "live" or row["owner"] != f"live:{self.owner}":
             raise ValueError("請登入並選定此正式策略所屬帳戶，再查詢券商委託")
         result = self.broker.order_diagnostics(p.symbol)
         local = self.store.orders(strategy_id)
+        partition = [o for o in self.store.orders() if o["owner"] == row["owner"] and o["symbol"] == p.symbol]
         for report in result["rows"]:
             matches = [
                 o["id"]
-                for o in local
+                for o in partition
                 if report_matches(o, {"broker_org": report["orig_seqnum"], "broker_id": report["orderno"]})
             ]
             report["local_orders"] = matches
-            report["match"] = "matched" if len(matches) == 1 else "ambiguous" if matches else "unmatched"
+            matched = next((o for o in partition if matches == [o["id"]]), None)
+            if matched:
+                report["match"] = "matched" if compatible(matched, report) else "conflict"
+                if report["match"] == "matched" and matched["strategy_id"] != strategy_id:
+                    report["match"] = "other_strategy"
+            else:
+                report["match"] = "ambiguous" if matches else "unmatched"
             report["original_reference"] = broker_reference(report["orig_seqnum"], "")
+            report["pairing"] = (
+                self.store.order_evidence(matched["id"]).get("order_pairing") if matched else None
+            )
         result["local_orders"] = [
             {
                 k: o[k]
@@ -552,6 +705,30 @@ class Core:
         ]
         result["symbol"] = p.symbol
         result["note"] = "僅查詢此帳戶此商品報表；不以商品價格猜配，不自動改帳、重送或撤單。"
+        result["coverage_note"] = (
+            "只代表查詢當時券商回傳的報表，不能證明歷史委託全數齊備；均價空白或0不覆寫既有成交。"
+        )
+        result["match_counts"] = {
+            label: sum(r["match"] == label for r in result["rows"])
+            for label in ("matched", "other_strategy", "unmatched", "ambiguous", "conflict")
+        }
+        result["saved"] = False
+        with self.store.transaction():
+            self.store.db.execute(
+                "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
+                (strategy_id, "broker_query", encode(result), result["queried_at"]),
+            )
+            if (
+                result["match_counts"]["unmatched"]
+                or result["match_counts"]["ambiguous"]
+                or result["match_counts"]["conflict"]
+            ):
+                self.store.event(
+                    "broker_query_attention",
+                    "券商查核有未配對或識別衝突；已保留查核快照，不自動認領或重送",
+                    strategy_id,
+                )
+        result["history"] = self.diagnostics_history(strategy_id)
         self.audit.emit("order_diagnostics", strategy_id=strategy_id, result=result)
         return result
 

@@ -7,6 +7,7 @@ import time
 from .brokers.order_diagnostics import error_catalog, normalize_rows, report_matches
 from .brokers.superpy import shares, source_time
 from .models import ET, decimal, utcnow
+from .storage import encode
 
 
 def digest(value):
@@ -521,9 +522,34 @@ class Recovery:
                             data["broker_id"],
                             source_time=data["source_time"],
                         )
+                        basis = (
+                            "identity" if item["basis"] == "identity" and key == item["choice"] else "manual"
+                        )
+                        c.store.db.execute(
+                            "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
+                            (
+                                s["id"],
+                                "order_pairing",
+                                encode(
+                                    {
+                                        "order_id": item["id"],
+                                        "basis": basis,
+                                        "confirmed_at": utcnow().isoformat(),
+                                        "local_created_at": item["created_at"],
+                                        "broker_create_time": report["create_time"],
+                                        "broker_trade_date": report["trade_date"],
+                                        "broker_org": data["broker_org"],
+                                        "broker_id": data["broker_id"],
+                                        "status": data["status"],
+                                        "preview_version": plan["version"],
+                                    }
+                                ),
+                                utcnow().isoformat(),
+                            ),
+                        )
                         c.store.event(
                             "recovery_pair",
-                            f"確認配對 {item['id']}：{item['basis']}；{data['raw_status']}",
+                            f"確認配對 {item['id']}：{basis}；{data['raw_status']}",
                             s["id"],
                         )
                     pending = c.store.pending(s["id"])

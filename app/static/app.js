@@ -25,7 +25,7 @@ function strategy(){return state?.strategies.find(s=>s.id===selected);}
 function position(sid){return state?.report.rows.find(p=>p.strategy_id===sid);}
 function settlementLabel(value){return value==="TWD"?"TWD 台幣":value==="MUT"?"MUT 外幣":"未知";}
 function canRetry(s,o){const orders=state.orders.filter(x=>x.strategy_id===s.id);return s.mode==="live"&&s.status==="paused"&&o?.id===orders.at(-1)?.id&&o?.status==="rejected"&&!o.unknown&&!o.filled&&!orders.some(x=>!terminal.has(x.status)||x.unknown);}
-function defaultParams(){const d=new Date();d.setDate(d.getDate()+30);return {name:"AAPL 雙邊網格",symbol:"AAPL",mode:"demo",direction:"both",start_price:"100",gap:"2",gap_unit:"amount",quantity:10,min_inventory:0,initial_inventory:0,max_inventory:100,initial_cost:null,opening_confirmed:false,lower_price:"80",upper_price:"120",max_order_value:"2000",daily_buy_limit:"10000",currency:"MUT",end_date:d.toISOString().slice(0,10),quote_max_age:15};}
+function defaultParams(){const d=new Date();d.setDate(d.getDate()+30);return {name:"AAPL 雙邊網格",symbol:"AAPL",mode:"demo",direction:"both",start_price:"100",gap:"2",gap_unit:"amount",quantity:10,min_inventory:0,initial_inventory:0,max_inventory:100,initial_cost:null,opening_confirmed:false,lower_price:"80",upper_price:"120",max_order_value:"2000",daily_buy_limit:"10000",currency:"MUT",end_date:d.toISOString().slice(0,10),quote_max_age:15,pause_buys_below_lower:false};}
 function openStrategy(s=null){openGridEditor(s);}
 
 function readParams(){const p={};for(const input of $("strategy-form").elements){if(!input.name)continue;p[input.name]=input.type==="checkbox"?input.checked:input.value;}for(const key of ["quantity","min_inventory","initial_inventory","max_inventory","quote_max_age"])p[key]=Number(p[key]);p.initial_cost=p.initial_cost===""?null:p.initial_cost;return p;}
@@ -73,6 +73,7 @@ function renderSettings(){
  if(!s){host.append(el("p","選取上方策略查看設定。","help"));return;}
  const p=s.params,pos=position(s.id),q=state.quotes[s.id],grid=el("dl",undefined,"settings-grid");
  const fields=[["結算方式（後續新單）",settlementLabel(p.currency)],["策略名稱",p.name],["監控商品",p.symbol],["策略方向",p.direction==="both"?"雙邊買賣":p.direction==="buy"?"單邊買進":"單邊賣出"],["執行模式",modeNames[s.mode]],["起始價位",number(p.start_price)],["網格基準",number(s.anchor)],["網格間距",`${number(p.gap)} ${p.gap_unit==="percent"?"%（起始價）":"USD"}`],["每筆股數",`${p.quantity} 股`],["庫存下限",`${p.min_inventory} 股`],["庫存上限",`${p.max_inventory} 股`],["目前部位",`${pos?.quantity??0} 股`],["最新行情",s.mode==="demo"?(q?`${number(q.price)} USD（離線）`:"尚未取得"):marketText(state.market?.[p.symbol],p.symbol)],["買價下界",number(p.lower_price)],["賣價上界",number(p.upper_price)],["單筆金額上限",`${number(p.max_order_value)} USD`],["每日買入上限",`${number(p.daily_buy_limit)} USD`]];
+ fields.push(["行情低於買價下界",p.pause_buys_below_lower?"不新增買單，回到範圍自動繼續":"只限制委託限價，允許較低成交價"]);
  for(const [label,value]of fields)grid.append(el("dt",label),el("dd",value));
  host.append(grid);
  const note=el("p",s.reason||"設定僅供查閱；修改請按策略列的「編輯」。","settings-note");
@@ -84,6 +85,7 @@ else if(tab==="orders"){
  if(s.mode==="live")body.append(button("查詢券商委託",()=>openOrderDiagnostics(s)));
  body.append(table(["方向","限價","成交／委託","狀態與原因","原單號","送單結算方式","操作"],orders.slice().reverse().map(o=>{
   const actions=el("div",undefined,"row-actions");
+  actions.append(button("送單依據",()=>openOrderEvidence(o)));
   if(canRetry(s,o))actions.append(button("重新送單",()=>beginRetryFlow(s,o),"danger"));
   if(o.unknown&&s.mode==="live")actions.append(button("查核配對",()=>safe(()=>openRecovery([s.id],false))));
   if(o.filled&&terminal.has(o.status))actions.append(button("核對費用",()=>feeDialog(o)));
