@@ -26,9 +26,26 @@ function Invoke-GridStartupProbe([string]$Url) {
     $client = New-Object Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(2)
     $client.MaxResponseContentBufferSize = 65536
-    try { return $client.GetStringAsync($Url).GetAwaiter().GetResult() }
+    try {
+        $request = $client.GetStringAsync($Url)
+        while ($script:SetupForm -and -not $request.IsCompleted) {
+            Update-SetupProgress
+            if ($script:SetupCanCancel -and $script:SetupCancelRequested) { return $null }
+            [Threading.Thread]::Sleep(50)
+        }
+        return $request.GetAwaiter().GetResult()
+    }
     catch { return $null }
     finally { $client.Dispose() }
+}
+
+function Get-GridHealthWorkbench([object]$Health, [int]$Port, [string]$Runtime) {
+    try {
+        if (-not $Health -or $Health.product -ne 'kgi-us-grid-web' -or $Health.protocol -ne 1 -or
+            $Health.ready -ne $true -or $Health.runtime_id -ne (Get-GridRuntimeId $Runtime) -or
+            [string]$Health.instance -notmatch '^[a-f0-9]{32}$' -or [int]$Health.pid -le 0) { return $null }
+        return @{ url = "http://127.0.0.1:$Port/"; backend_pid = [int]$Health.pid; instance = [string]$Health.instance; identity = 'health' }
+    } catch { return $null }
 }
 
 function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
@@ -38,10 +55,7 @@ function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
         $health = if ($healthText) { $healthText | ConvertFrom-Json } else { $null }
         if ($health -and $health.product) {
             # A modern identity mismatch is conclusive; do not downgrade to legacy matching.
-            if ($health.product -ne 'kgi-us-grid-web' -or $health.protocol -ne 1 -or
-                $health.ready -ne $true -or $health.runtime_id -ne (Get-GridRuntimeId $Runtime) -or
-                [string]$health.instance -notmatch '^[a-f0-9]{32}$' -or [int]$health.pid -le 0) { return $null }
-            return @{ url = $url; backend_pid = [int]$health.pid; instance = [string]$health.instance; identity = 'health' }
+            return Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
         }
         # Older running releases cannot acquire a new endpoint without a restart.
         # Bind their HTTP surface to this launch.pyw and the selected runtime's
@@ -145,7 +159,10 @@ function Update-SetupProgress {
         $elapsed = [DateTime]::UtcNow - $script:SetupStarted
         $idle = [int]([DateTime]::UtcNow - $script:SetupLastActivity).TotalSeconds
         $script:SetupStatus.Text = ('已經過 {0} 分 {1} 秒；最近訊息：{2} 秒前。' -f $elapsed.Minutes, $elapsed.Seconds, $idle)
-        if ($idle -ge 30) { $script:SetupStatus.Text += '  正在等待下載或檢查；可取消後重試。' }
+        if ($idle -ge 30) {
+            if ($script:SetupCanCancel) { $script:SetupStatus.Text += '  正在等待下載或檢查；可取消後重試。' }
+            else { $script:SetupStatus.Text += '  仍在等待工作台就緒；請保留此視窗。' }
+        }
     }
     if ($script:SetupForm) { [Windows.Forms.Application]::DoEvents() }
 }
@@ -195,6 +212,7 @@ function Invoke-SetupProcess([string]$File, [string[]]$Arguments, [string]$Log,
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $info
     try {
+        $started = [DateTime]::UtcNow
         if (-not $process.Start()) { throw 'Unable to launch setup process' }
         $readers = @($process.StandardOutput, $process.StandardError)
         $pending = @($readers[0].ReadLineAsync(), $readers[1].ReadLineAsync())
@@ -226,18 +244,50 @@ function Invoke-SetupProcess([string]$File, [string[]]$Arguments, [string]$Log,
             [Threading.Thread]::Sleep(100)
         }
         $code = $process.ExitCode
-        Write-SetupEvent $Log 'setup_result' @{ stage = $Stage; exit_code = $code }
+        Write-SetupEvent $Log 'setup_result' @{
+            stage = $Stage; exit_code = $code
+            elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
+        }
         if ($code -ne 0 -and -not $AllowFailure) { throw "Setup failed at $Stage (exit $code)" }
         return $code
     } finally { $process.Dispose() }
 }
 
+function Initialize-SetupProgress([switch]$NoUI) {
+    $script:SetupForm = $null
+    $script:SetupLabel = $null
+    $script:SetupOutput = $null
+    $script:SetupStatus = $null
+    $script:SetupCancel = $null
+    $script:SetupNote = $null
+    $script:SetupNoUI = [bool]$NoUI
+    $script:SetupStarted = [DateTime]::UtcNow
+    $script:SetupLastActivity = $script:SetupStarted
+    $script:SetupMessages = @()
+    $script:SetupCancelRequested = $false
+    $script:SetupCanCancel = $true
+    $script:SetupDetail = ''
+}
+
+function Close-SetupProgress {
+    if ($script:SetupForm) {
+        $script:SetupForm.Close()
+        $script:SetupForm.Dispose()
+        $script:SetupForm = $null
+    }
+    $script:SetupLabel = $null
+    $script:SetupOutput = $null
+    $script:SetupStatus = $null
+    $script:SetupCancel = $null
+    $script:SetupNote = $null
+}
+
 function Set-SetupProgress([string]$Text, [switch]$NoUI) {
-    if ($NoUI) { Write-Host $Text; return }
+    if ($NoUI -or $script:SetupNoUI) { Write-Host $Text; return }
     if (-not $script:SetupForm) {
         Add-Type -AssemblyName System.Windows.Forms
         $script:SetupForm = New-Object Windows.Forms.Form
-        $script:SetupForm.Text = 'KGI 美股網格工作台：準備環境'
+        $script:SetupForm.Text = 'KGI 美股網格工作台：正在啟動'
         $script:SetupForm.ClientSize = New-Object Drawing.Size(720, 390)
         $script:SetupForm.StartPosition = 'CenterScreen'
         $script:SetupForm.FormBorderStyle = 'FixedDialog'
@@ -262,11 +312,16 @@ function Set-SetupProgress([string]$Text, [switch]$NoUI) {
         $cancel.Text = '取消準備'
         $cancel.Location = New-Object Drawing.Point(595, 345)
         $cancel.Size = New-Object Drawing.Size(105, 28)
-        $cancel.Add_Click({ $script:SetupCancelRequested = $true })
+        $cancel.Add_Click({
+            if ($script:SetupCanCancel) { $script:SetupCancelRequested = $true }
+            else { $script:SetupForm.Hide() }
+        })
+        $script:SetupCancel = $cancel
         $note = New-Object Windows.Forms.Label
         $note.Text = '首次下載可能需數分鐘；套件安裝最多等待 15 分鐘。不會登入券商。'
         $note.Location = New-Object Drawing.Point(20, 350)
         $note.Size = New-Object Drawing.Size(570, 30)
+        $script:SetupNote = $note
         $script:SetupForm.Controls.AddRange(@($script:SetupLabel, $script:SetupStatus, $script:SetupOutput, $bar, $cancel, $note))
         $script:SetupForm.Show()
     }
@@ -275,8 +330,45 @@ function Set-SetupProgress([string]$Text, [switch]$NoUI) {
     Update-SetupProgress
 }
 
+function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$Backend,
+                            [int]$Timeout = 180) {
+    $script:SetupStage = 'server_startup'
+    $script:SetupCanCancel = $false
+    if ($script:SetupCancel) { $script:SetupCancel.Text = '隱藏提示' }
+    if ($script:SetupNote) { $script:SetupNote.Text = '完成後自動開啟瀏覽器；隱藏提示只收起此視窗，程式繼續啟動。' }
+    Set-SetupProgress '環境已就緒；正在載入市場日曆與帳本。完成後會自動開啟工作台。'
+    $started = [DateTime]::UtcNow
+    # One owned launch, one finite readiness deadline; never kill or relaunch on timeout.
+    $deadline = $started.AddSeconds($Timeout)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Update-SetupProgress
+        if ($Backend.HasExited) {
+            $script:SetupDetail = "後端未完成啟動（退出碼：$($Backend.ExitCode)）。請保留紀錄並重新檢查環境。"
+            Write-SetupEvent $script:SetupLog 'workbench_startup_failed' @{ exit_code = $Backend.ExitCode }
+            throw 'Workbench exited before readiness'
+        }
+        # This newly launched source supports health identity. Legacy discovery can
+        # fall through to slow CIM initialization while the new server becomes ready.
+        $healthText = Invoke-GridStartupProbe "http://127.0.0.1:$Port/api/health"
+        $health = $null
+        if ($healthText) { try { $health = $healthText | ConvertFrom-Json } catch { } }
+        $ready = Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
+        if ($ready) {
+            Write-SetupEvent $script:SetupLog 'workbench_ready' @{
+                backend_pid = $ready.backend_pid; port = $Port
+                elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
+            }
+            return $ready
+        }
+        [Threading.Thread]::Sleep(200)
+    }
+    $script:SetupDetail = "啟動等待超過 $Timeout 秒；背景程序狀態尚未確認，沒有重啟或強制停止。請查看紀錄，勿刪除鎖檔。若稍後完成，可開啟 http://127.0.0.1:$Port/。"
+    Write-SetupEvent $script:SetupLog 'workbench_startup_timeout' @{ timeout_seconds = $Timeout; port = $Port }
+    throw 'Workbench readiness timeout'
+}
+
 function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switch]$Repair,
-                                     [string]$UvPath = '') {
+                                     [string]$UvPath = '', [switch]$KeepProgress) {
     if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
         throw 'Windows x64 is required'
     }
@@ -285,15 +377,7 @@ function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switc
     New-Item -ItemType Directory -Path $directory, $logDirectory -Force | Out-Null
     $log = Join-Path $logDirectory 'bootstrap.jsonl'
     $script:SetupLog = $log
-    $script:SetupForm = $null
-    $script:SetupOutput = $null
-    $script:SetupStatus = $null
-    $script:SetupNoUI = [bool]$NoUI
-    $script:SetupStarted = [DateTime]::UtcNow
-    $script:SetupLastActivity = $script:SetupStarted
-    $script:SetupMessages = @()
-    $script:SetupCancelRequested = $false
-    $script:SetupDetail = ''
+    if (-not $script:SetupStarted) { Initialize-SetupProgress -NoUI:$NoUI }
     $script:SetupStage = 'environment_lock'
     $environmentLock = $null
     $runtimeLock = $null
@@ -387,7 +471,7 @@ function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switc
     } finally {
         if ($runtimeLock) { $runtimeLock.Dispose() }
         if ($environmentLock) { $environmentLock.Dispose() }
-        if ($script:SetupForm) { $script:SetupForm.Close(); $script:SetupForm.Dispose(); $script:SetupForm = $null }
+        if (-not $KeepProgress) { Close-SetupProgress }
     }
 }
 

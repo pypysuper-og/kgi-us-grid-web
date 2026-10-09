@@ -70,10 +70,10 @@ class Core:
         # History is append-only. Restore just the last matching book per owner;
         # unrelated snapshot kinds must not replace a saved matching book.
         saved_books = self.store.rows(
-            "SELECT s.owner,s.data FROM broker_snapshots AS s JOIN "
-            "(SELECT owner,MAX(id) AS id FROM broker_snapshots "
-            "WHERE json_type(data,'$.paper_book') IS NOT NULL GROUP BY owner) AS latest "
-            "ON s.id=latest.id ORDER BY s.id"
+            "SELECT s.owner,s.data FROM (SELECT DISTINCT owner FROM broker_snapshots) AS owners "
+            "JOIN broker_snapshots AS s ON s.id=(SELECT id FROM broker_snapshots "
+            "WHERE owner=owners.owner AND json_type(data,'$.paper_book') IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1) ORDER BY s.id"
         )
         for row in saved_books:
             data = json.loads(row["data"])

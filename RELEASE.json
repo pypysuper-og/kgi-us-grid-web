@@ -1,9 +1,9 @@
 {
   "name": "kgi-us-grid-web",
-  "version": "0.1.3",
-  "source_commit": "8a98a233a52f770931a8a993c186e9f89a3d3aca",
+  "version": "0.1.4",
+  "source_commit": "27fc01d73c67e6fa2066ebafd4b0735bb4376faf",
   "source_modified": false,
-  "content_fingerprint": "4f1a3b1e2c92bd3649f8d514eeab646a3b801017567ad1224d43cf7267f61413",
+  "content_fingerprint": "b50b526c7d650dc9179b4849de5c88b0157a6e97e4920595ef20f4fc82060fb3",
   "type": "source",
   "sdk": "2.1.2",
   "python": "3.12-x64"

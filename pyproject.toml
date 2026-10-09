@@ -1,6 +1,6 @@
 [project]
 name = "kgi-us-grid-web"
-version = "0.1.3"
+version = "0.1.4"
 description = "Local US grid trading workbench with a persistent execution ledger"
 requires-python = ">=3.12,<3.13"
 dependencies = [
