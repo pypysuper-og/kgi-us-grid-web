@@ -45,6 +45,7 @@ ACTIONS = {
     "retry_order",
     "recovery_preview",
     "recovery_confirm",
+    "recovery_takeover",
     "bulk_stop",
     "ui_preferences",
 }
@@ -163,7 +164,7 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.4"}
+        return {"token": token, "instance": instance, "version": "0.1.5"}
 
     @app.get("/api/health")
     def health():
@@ -172,7 +173,7 @@ def create_app(path=None, service_factory=Service):
             "product": "kgi-us-grid-web",
             "protocol": 1,
             "instance": instance,
-            "version": "0.1.4",
+            "version": "0.1.5",
             "pid": os.getpid(),
             "runtime_id": runtime_identity(directory),
             "ready": service.thread.is_alive() and not service.stop_event.is_set(),

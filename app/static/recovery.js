@@ -9,8 +9,9 @@ async function openRecovery(ids=null,start=false,after=null){
  }
  const targets=ids===null?eligibleStrategies():state.strategies.filter(s=>ids.includes(s.id));
  if(!targets.length){toast("目前帳戶沒有可恢復的策略");return;}
+ if(state.recovery_status!==undefined)await command("recovery_takeover",{strategy_ids:targets.map(s=>s.id)});
  if(start&&targets.some(s=>s.mode==="live"&&s.status!=="active")&&!state.live_available){
-  recoveryIntent={ids:targets.map(s=>s.id),start,after};openLiveSettings(targets.find(s=>s.mode==="live"));return;
+  recoveryIntent={ids:targets.map(s=>s.id),start,after};openLiveSettings(null,targets);return;
  }
  recoveryContext={ids:targets.map(s=>s.id),start,after};
  $("recovery-title").textContent=start?"查核、配對並恢復監控":"委託配對與對帳";

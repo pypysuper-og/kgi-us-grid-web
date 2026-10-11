@@ -14,8 +14,12 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
+SCHEMA_VERSION = 3
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ui_preferences(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS live_preferences(owner TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(owner TEXT PRIMARY KEY, mode TEXT NOT NULL, identity TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS strategies(
@@ -62,7 +66,7 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 3:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise ValueError("資料庫版本較新；請使用對應程式，不會降版")
         self.db.executescript(SCHEMA)
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(fills)")}
@@ -85,7 +89,7 @@ class Store:
                 self.db.execute(
                     "UPDATE orders SET settlement_currency=? WHERE strategy_id=?", (currency, strategy["id"])
                 )
-        self.db.execute("PRAGMA user_version=3")
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1,?)", (utcnow().isoformat(),))
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(2,?)", (utcnow().isoformat(),))
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(3,?)", (utcnow().isoformat(),))
@@ -133,6 +137,19 @@ class Store:
                 (encode(values),),
             )
         return values
+
+    def live_preferences(self, owner):
+        if not owner:
+            return {}
+        rows = self.rows("SELECT data FROM live_preferences WHERE owner=?", (owner,))
+        return json.loads(rows[0]["data"]) if rows else {}
+
+    def set_live_preferences(self, owner, values):
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO live_preferences VALUES(?,?) ON CONFLICT(owner) DO UPDATE SET data=excluded.data",
+                (owner, encode(values)),
+            )
 
     def event(self, kind, message, sid=None):
         self.db.execute(

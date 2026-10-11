@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 
 from app.server import RuntimeLock
+from app.storage import SCHEMA_VERSION
 
 
 def restore(source: Path, destination: Path):
@@ -18,7 +19,7 @@ def restore(source: Path, destination: Path):
             or original.execute("PRAGMA foreign_key_check").fetchall()
         ):
             raise ValueError("來源完整性檢查失敗")
-        if original.execute("PRAGMA user_version").fetchone()[0] != 1:
+        if not 1 <= original.execute("PRAGMA user_version").fetchone()[0] <= SCHEMA_VERSION:
             raise ValueError("來源 schema 不相容")
         # mkdir without exist_ok arbitrates concurrent attempts before creating any DB.
         destination.mkdir(parents=True, exist_ok=False)

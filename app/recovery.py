@@ -3,10 +3,14 @@
 import hashlib
 import json
 import time
+import uuid
+from contextlib import nullcontext
+from copy import deepcopy
+from datetime import timedelta
 
 from .brokers.order_diagnostics import error_catalog, normalize_rows, report_matches
 from .brokers.superpy import shares, source_time
-from .models import ET, decimal, utcnow
+from .models import ET, TW, decimal, utcnow
 from .storage import encode
 
 
@@ -105,19 +109,257 @@ class Recovery:
     def __init__(self, core):
         self.core = core
         self.plan = None
+        self.states = {}
+        self.retry_due = {}
+        self.start_guard = lambda sid: nullcontext(True)
+        self.publish = lambda: None
 
-    def resume_reconnected(self, intent):
+    @staticmethod
+    def manual_targets(action, payload, orders=()):
+        if action in {"logout", "shutdown", "bulk_stop", "live_control", "select_account"}:
+            return ["*"]
+        if action in {"recovery_takeover", "recovery_preview"}:
+            ids = payload.get("strategy_ids")
+            return ["*"] if ids is None else ids if isinstance(ids, list) else []
+        if action in {"start", "stop", "edit", "archive", "reconcile", "order_diagnostics", "opening_cost"}:
+            return [payload["strategy_id"]] if payload.get("strategy_id") else []
+        if action in {"retry_order", "fee"}:
+            return [o["strategy_id"] for o in orders if o["id"] == payload.get("order_id")]
+        return []
+
+    def take_over(self, ids, action="manual"):
+        c = self.core
+        intent = c.reconnect_resume
+        if not intent:
+            return []
+        targets = set(intent["strategies"]) if "*" in ids else set(ids) & set(intent["strategies"])
+        for sid in targets:
+            intent["strategies"].pop(sid, None)
+            self.retry_due.pop(sid, None)
+            state = self.states.setdefault(sid, {})
+            state.update(state="manual", retry_at=None, message="使用者已接手；背景查核與自動恢復已停止")
+            c.quote_warnings.pop(sid, None)
+            c.audit.emit("reconnect_manual_takeover", strategy_id=sid, action=action)
+            c.store.event("reconnect_manual_takeover", state["message"], sid)
+        if targets and not c.broker.disconnected.is_set():
+            if not intent["strategies"]:
+                c.reconnect_resume = None
+            self.update_stage(intent)
+        return sorted(targets)
+
+    def update_stage(self, intent):
+        c = self.core
+        active_count = sum(s["status"] == "active" and s["mode"] != "demo" for s in c.store.strategies())
+        waiting = len(intent["strategies"])
+        paused_ids = {s["id"] for s in c.store.strategies() if s["status"] == "paused"}
+        manual = sum(sid in paused_ids and s.get("state") == "manual" for sid, s in self.states.items())
+        c.stage = f"券商已重連；{active_count} 組監控已啟用"
+        if waiting:
+            c.stage += f"；{waiting} 組暫停，將定期自動查核，亦可由您接手"
+        if manual:
+            c.stage += f"；{manual} 組暫停，需由您處理"
+        c.broker.status(phase="connected", attempt=0, retry_at=None, message=c.stage)
+
+    def stop_for_terminal_report(self, order, report):
+        c = self.core
+        sid = order["strategy_id"]
+        intent = c.reconnect_resume
+        if (
+            report["status"] not in {"rejected", "canceled", "expired"}
+            or (order["status"] in {"filled", "rejected", "canceled", "expired"} and not order["unknown"])
+            or not intent
+            or sid not in intent["strategies"]
+        ):
+            return False
+        message = "券商已確認委託拒絕／撤銷／到期，停止自動恢復，保留部位待您處理：" + c.audit.redactor.text(
+            report.get("message") or report.get("raw_status") or report["status"]
+        )[:400]
+        state = self.states.setdefault(sid, {})
+        receipt = c.audit.clean(
+            {
+                "recovery_id": intent.get("recovery_id"),
+                "strategy_id": sid,
+                "order_id": order["id"],
+                "previous_check_id": state.get("evidence_id"),
+                "received_at": utcnow().isoformat(),
+                "report": report,
+                "local_order": next(o for o in c.store.orders(sid) if o["id"] == order["id"]),
+                "local_position": c.store.position(sid),
+                "orders_used": c.session_order_count,
+                "orders_limit": c.session_order_limit,
+                "outcome": "manual",
+                "message": message,
+            }
+        )
+        intent["strategies"].pop(sid)
+        self.retry_due.pop(sid, None)
+        state.update(
+            state="manual", retry_at=None, message=message,
+            terminal_order_id=order["id"], terminal_status=report["status"],
+        )
+        with c.store.transaction():
+            c.fail(sid, message)
+            c.store.db.execute(
+                "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
+                (sid, "reconnect_terminal_stop", encode(receipt), receipt["received_at"]),
+            )
+        c.audit.emit("reconnect_terminal_stop", evidence=receipt)
+        if not c.broker.disconnected.is_set():
+            c.reconnect_resume = intent if intent["strategies"] else None
+            self.update_stage(intent)
+        return True
+
+    def snapshot(self):
+        return deepcopy(self.states)
+
+    def retry(self, now=None):
+        c = self.core
+        if not c.reconnect_resume or c.broker.disconnected.is_set() or c.closing or c.fault:
+            return
+        now = time.monotonic() if now is None else now
+        due = [sid for sid, deadline in self.retry_due.items() if deadline <= now]
+        if due:
+            self.resume_reconnected(c.reconnect_resume, now, due)
+
+    def inventory_query(self, symbols, evidence=None, phase="initial"):
+        observation = {
+            "operation": "SubAccount.StockPositionReport",
+            "phase": phase,
+            "requested_at": utcnow().isoformat(),
+            "state": "unknown",
+            "rows": None,
+        }
+        if evidence is not None:
+            evidence["inventory_queries"].append(observation)
+        try:
+            rows = self.core.broker.positions()
+            observation.update(
+                state="available",
+                received_at=utcnow().isoformat(),
+                rows=[r for r in rows if r.get("symbol") in symbols],
+            )
+            return rows
+        except Exception as exc:
+            observation.update(
+                state="unavailable",
+                received_at=utcnow().isoformat(),
+                error_type=type(exc).__name__,
+                message=self.core.audit.redactor.text(str(exc))[:400],
+            )
+            raise
+
+    def persist_check(self, check, outcome, message=""):
+        c = self.core
+        check.update(outcome=outcome, message=message, recorded_at=utcnow().isoformat())
+        clean = c.audit.clean(check)
+        with c.store.transaction():
+            c.store.db.execute(
+                "INSERT INTO ledger_entries(strategy_id,kind,data,time) VALUES(?,?,?,?)",
+                (check["strategy_id"], "reconnect_check", encode(clean), check["recorded_at"]),
+            )
+        c.audit.emit("reconnect_strategy_check", evidence=clean)
+
+    def resume_reconnected(self, intent, now=None, strategy_ids=None):
+        c = self.core
+        if intent is None:
+            return []
+        if strategy_ids is None:
+            self.plan = None
+        ids = set(intent["strategies"]) if strategy_ids is None else set(strategy_ids)
+        scoped = {
+            **intent,
+            "strategies": {sid: row for sid, row in intent["strategies"].items() if sid in ids},
+        }
+        recovery_id = intent.setdefault("recovery_id", uuid.uuid4().hex)
+        batch_id = uuid.uuid4().hex
+        checks = {}
+        for sid, saved in scoped["strategies"].items():
+            state = self.states.setdefault(sid, {})
+            attempt = state.get("attempt", 0) + 1
+            checks[sid] = {
+                "schema": 1,
+                "id": uuid.uuid4().hex,
+                "audit_run_id": c.audit.run_id,
+                "recovery_id": recovery_id,
+                "batch_id": batch_id,
+                "strategy_id": sid,
+                "revision": saved["revision"],
+                "mode": saved["mode"],
+                "strategy_config": deepcopy(saved["params"]),
+                "symbol": saved["params"]["symbol"],
+                "account_reference": intent["owner"],
+                "selected_reference": digest(intent["selected"]),
+                "current_account_reference": c.owner,
+                "current_selected_reference": digest(c.broker.selected),
+                "generation": c.generation,
+                "limits": {
+                    "orders_used": c.session_order_count,
+                    "orders_limit": c.session_order_limit,
+                    "daily_buy_limit": str(c.account_limit) if c.account_limit is not None else None,
+                },
+                "attempt": attempt,
+                "started_at": utcnow().isoformat(),
+                "retryable": True,
+                "local_before": {"position": c.store.position(sid), "orders": c.store.orders(sid)},
+                "inventory_queries": [],
+                "inventory": {
+                    "broker_quantity": None,
+                    "local_quantity": None,
+                    "confirmed_external_quantity": c.inventory_offsets.get(
+                        (saved["owner"], saved["params"]["symbol"]), 0
+                    ),
+                    "expected_quantity": None,
+                    "difference": None,
+                },
+            }
+            state.update(state="checking", attempt=attempt, retry_at=None)
+        self.publish()
+        results = self._resume_once(scoped, checks)
+        finished_at = time.monotonic() if now is None else now
+        for result in results:
+            sid, outcome = result["id"], result["status"]
+            check, state = checks[sid], self.states[sid]
+            state.update(
+                last_checked_at=utcnow().isoformat(),
+                message=result["message"],
+                evidence_id=check["id"],
+                inventory=deepcopy(check["inventory"]),
+            )
+            self.persist_check(check, outcome, result["message"])
+            if c.broker.disconnected.is_set():
+                state.update(state="connection_wait", retry_at=None)
+                self.retry_due.pop(sid, None)
+                continue
+            if state.get("state") == "manual":
+                intent["strategies"].pop(sid, None)
+                self.retry_due.pop(sid, None)
+                continue
+            if outcome == "blocked" and check["retryable"] and sid in intent["strategies"]:
+                delay = min(300, 60 * 2 ** min(state["attempt"] - 1, 3))
+                self.retry_due[sid] = finished_at + delay
+                state.update(state="retry_wait", retry_at=(utcnow() + timedelta(seconds=delay)).isoformat())
+            else:
+                intent["strategies"].pop(sid, None)
+                self.retry_due.pop(sid, None)
+                state.update(state="resumed" if outcome == "active" else "manual", retry_at=None)
+        if not c.broker.disconnected.is_set():
+            c.reconnect_resume = intent if intent["strategies"] else None
+            self.update_stage(intent)
+        return results
+
+    def _resume_once(self, intent, checks):
         """Restore this process's previous run intent after a same-account reconnect.
 
         Confirmed reports are applied before inventory checks across sibling strategies.
         No order creation, cancellation, inferred identity, or budget refresh occurs here.
         """
         c = self.core
-        self.plan = None
         results, ready = [], []
 
-        def blocked(sid, exc):
+        def blocked(sid, exc, retryable=True):
             message = "重連查核待處理：" + c.audit.redactor.text(str(exc))[:400]
+            checks[sid]["retryable"] = retryable
+            checks[sid]["error_type"] = type(exc).__name__
             c.fail(sid, message)
             results.append({"id": sid, "status": "blocked", "message": message})
 
@@ -132,7 +374,7 @@ class Recovery:
         )
         if not same_account:
             for sid in (intent or {}).get("strategies", {}):
-                blocked(sid, "帳戶已改變；不能沿用原會話的啟動授權")
+                blocked(sid, "帳戶已改變；不能沿用原會話的啟動授權", False)
         else:
             c.live_armed = bool(intent["armed"]) and not c.broker.disconnected.is_set()
             for sid, saved in intent["strategies"].items():
@@ -141,9 +383,13 @@ class Recovery:
                     results.append({"id": sid, "status": "skipped", "message": "策略已修改或封存，維持停止"})
                     continue
                 try:
+                    if row["params"]["end_date"] < utcnow().astimezone(TW).date().isoformat():
+                        checks[sid]["retryable"] = False
+                        raise ValueError("策略已超過停止日期，不自動恢復")
                     c.broker.require_selected()
                     if row["mode"] == "live":
-                        snapshot = self.fetch([row])
+                        snapshot = self.fetch([row], checks[sid])
+                        checks[sid]["broker_snapshot"] = snapshot
                         terminal_problem = ""
                         with c.store.transaction():
                             for order in c.store.pending(sid):
@@ -189,43 +435,77 @@ class Recovery:
                                         "委託已拒絕／撤銷／到期，保留部位待確認：" + data["raw_status"]
                                     )
                         if terminal_problem:
+                            checks[sid]["retryable"] = False
                             raise ValueError(terminal_problem)
                     else:
-                        check = c.cmd_reconcile(sid)
+                        check = c.reconcile_strategy(sid)
+                        checks[sid]["paper_comparison"] = check
                         if not check["matched"] or check["unknown_orders"]:
                             raise ValueError("模擬帳本有未對應差異")
                     ready.append(sid)
                 except Exception as exc:
-                    blocked(sid, exc)
+                    blocked(sid, exc, checks[sid]["retryable"])
 
             # Requery holdings after applying all observed fills, not before them.
             positions, position_error = None, None
+            final_observation = {"inventory_queries": []}
             if any(c.store.strategy(sid)["mode"] == "live" for sid in ready):
                 try:
-                    positions = c.broker.positions()
+                    positions = self.inventory_query(
+                        {c.store.strategy(sid)["params"]["symbol"] for sid in ready},
+                        final_observation,
+                        "final",
+                    )
                 except Exception as exc:
                     position_error = exc
             for sid in ready:
                 try:
+                    checks[sid]["inventory_queries"].extend(deepcopy(final_observation["inventory_queries"]))
                     row = c.store.strategy(sid)
                     c.broker.require_selected()
                     if row["mode"] == "live":
                         if position_error is not None:
                             raise position_error
                         symbol = row["params"]["symbol"]
-                        allocated = sum(
-                            r["quantity"]
+                        allocations = [
+                            r
                             for r in c.store.report()["rows"]
                             if r["owner"] == row["owner"] and r["symbol"] == symbol
-                        )
+                        ]
+                        allocated = sum(r["quantity"] for r in allocations)
+                        checks[sid]["local_allocations"] = [
+                            {k: r[k] for k in ("strategy_id", "symbol", "quantity")} for r in allocations
+                        ]
                         expected = allocated + c.inventory_offsets.get((row["owner"], symbol), 0)
-                        if c.broker.holdings(symbol, positions) != expected:
-                            raise ValueError("券商庫存與已確認部位不一致，請核對外部成交或未對應委託")
+                        held = c.broker.holdings(symbol, positions)
+                        checks[sid]["inventory"] = {
+                            "broker_quantity": held,
+                            "local_quantity": allocated,
+                            "confirmed_external_quantity": c.inventory_offsets.get((row["owner"], symbol), 0),
+                            "expected_quantity": expected,
+                            "difference": held - expected,
+                        }
+                        checks[sid]["local_after"] = {
+                            "position": c.store.position(sid),
+                            "orders": c.store.orders(sid),
+                        }
+                        if held != expected:
+                            raise ValueError(
+                                f"券商庫存 {held} 股／本地已分配 {allocated} 股＋已確認額外持股 {expected - allocated} 股＝預期 {expected} 股；差額 {held - expected:+d} 股，請核對外部成交或未對應委託"
+                            )
                     if any(o["unknown"] for o in c.store.pending(sid)):
                         raise ValueError("仍有未知委託，不自動重送")
                     with c.store.transaction():
+                        self.persist_check(checks[sid], "eligible")
+                        c.audit.require_writable()
                         c.store.db.execute("UPDATE strategies SET reconciled=1,reason='' WHERE id=?", (sid,))
-                        c.cmd_start(sid, row["revision"], confirm_live=True)
+                        c.start_strategy(
+                            sid,
+                            row["revision"],
+                            confirm_live=True,
+                            automatic=True,
+                            expected_generation=checks[sid]["generation"],
+                        )
                         c.store.event(
                             "reconnect_resumed", "重連自動查核完成，恢復斷線前監控；沿用剩餘額度", sid
                         )
@@ -241,7 +521,6 @@ class Recovery:
             c.stage = "查核期間再次斷線；將繼續自動重連"
             # Keep intent for the next connection attempt; never restore from database on boot.
         else:
-            c.reconnect_resume = None
             count = sum(r["status"] == "active" for r in results)
             blocked_count = sum(r["status"] == "blocked" for r in results)
             c.stage = f"券商已重連；自動恢復 {count} 組監控"
@@ -267,7 +546,7 @@ class Recovery:
             "positions": c.store.report()["rows"],
         }
 
-    def fetch(self, strategies):
+    def fetch(self, strategies, evidence=None):
         c = self.core
         live = [s for s in strategies if s["mode"] == "live"]
         result = {"reports": [], "executions": [], "holdings": {}, "cached": []}
@@ -275,11 +554,11 @@ class Recovery:
             return result
         c.broker.require_selected()
         symbols = {s["params"]["symbol"] for s in live}
-        positions = c.broker.positions()
+        positions = self.inventory_query(symbols, evidence)
         result["holdings"] = {symbol: c.broker.holdings(symbol, positions) for symbol in symbols}
         if not any(c.store.pending(s["id"]) for s in live):
             return result
-        result.update(self.report_snapshot(symbols))
+        result.update(self.report_snapshot(symbols, evidence=evidence))
         try:
             result["cached"] = [
                 {k: r.get(k) for k in ("broker_org", "broker_id", "tracked_ref", "client_ref")}
@@ -290,25 +569,41 @@ class Recovery:
         result["cached"].sort(key=digest)
         return result
 
-    def report_snapshot(self, symbols, originals=None):
+    def report_snapshot(self, symbols, originals=None, evidence=None):
         c = self.core
         result = {"reports": [], "executions": []}
-        rows = c.broker.invoke("SubAccount.OrderReport", c.broker.api.SubAccount.OrderReport).to_dict(
-            "records"
-        )
+        queries = evidence.setdefault("report_queries", []) if evidence is not None else []
+
+        def query(operation, fn):
+            observation = {"operation": operation, "requested_at": utcnow().isoformat(), "state": "unknown"}
+            queries.append(observation)
+            try:
+                rows = c.broker.invoke(operation, fn).to_dict("records")
+                observation.update(state="available", received_at=utcnow().isoformat())
+                return rows
+            except Exception as exc:
+                observation.update(
+                    state="unavailable",
+                    received_at=utcnow().isoformat(),
+                    error_type=type(exc).__name__,
+                    message=c.audit.redactor.text(str(exc))[:400],
+                )
+                raise
+
+        rows = query("SubAccount.OrderReport", c.broker.api.SubAccount.OrderReport)
         catalog, _ = error_catalog()
         for symbol in sorted(symbols):
             result["reports"].extend(normalize_rows(rows, symbol, catalog, c.audit.redactor))
         if originals is not None:
             result["reports"] = [r for r in result["reports"] if r["orig_seqnum"] in originals]
+        queries[-1]["rows"] = deepcopy(result["reports"])
         if any(shares(r["exe_qty"] or "0") for r in result["reports"]):
             fields = ("symbol", "orderno", "trade_type", "exe_qty", "exe_price", "trade_date")
-            fills = c.broker.invoke("SubAccount.ExecReport", c.broker.api.SubAccount.ExecReport).to_dict(
-                "records"
-            )
+            fills = query("SubAccount.ExecReport", c.broker.api.SubAccount.ExecReport)
             result["executions"] = [
                 {k: str(r.get(k, "")) for k in fields} for r in fills if r.get("symbol") in symbols
             ]
+            queries[-1]["rows"] = deepcopy(result["executions"])
         for key in ("reports", "executions"):
             result[key].sort(key=digest)
         return result

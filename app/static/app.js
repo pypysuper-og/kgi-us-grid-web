@@ -35,13 +35,15 @@ function position(sid){return state?.report.rows.find(p=>p.strategy_id===sid);}
 function settlementLabel(value){return value==="TWD"?"TWD 台幣":value==="MUT"?"MUT 外幣":"未知";}
 function canRetry(s,o){const orders=state.orders.filter(x=>x.strategy_id===s.id);return s.mode==="live"&&s.status==="paused"&&o?.id===orders.at(-1)?.id&&o?.status==="rejected"&&!o.unknown&&!o.filled&&!orders.some(x=>!terminal.has(x.status)||x.unknown);}
 function defaultParams(){const d=new Date();d.setDate(d.getDate()+30);return {name:"AAPL 雙邊網格",symbol:"AAPL",mode:"demo",direction:"both",start_price:"100",gap:"2",gap_unit:"amount",quantity:10,min_inventory:0,initial_inventory:0,max_inventory:100,initial_cost:null,opening_confirmed:false,lower_price:"80",upper_price:"120",max_order_value:"2000",daily_buy_limit:"10000",currency:"MUT",end_date:d.toISOString().slice(0,10),quote_max_age:15,pause_buys_below_lower:false};}
-function openStrategy(s=null){openGridEditor(s);}
+async function takeOverRecovery(s){if(s&&state?.recovery_status!==undefined)await command("recovery_takeover",{strategy_ids:[s.id]});}
+function openStrategy(s=null){return safe(async()=>{await takeOverRecovery(s);openGridEditor(s);});}
 
 function readParams(){const p={};for(const input of $("strategy-form").elements){if(!input.name)continue;p[input.name]=input.type==="checkbox"?input.checked:input.value;}for(const key of ["quantity","min_inventory","initial_inventory","max_inventory","quote_max_age"])p[key]=Number(p[key]);p.initial_cost=p.initial_cost===""?null:p.initial_cost;return p;}
 function actionDialog(title,content,actions,afterSuccess=null){$("action-title").textContent=title;$("action-body").replaceChildren();if(content instanceof Node)$("action-body").append(content);else $("action-body").append(el("p",content));$("action-error").textContent="";$("action-buttons").replaceChildren();for(const action of actions){const b=button(action.text,async()=>{b.disabled=true;try{await action.fn();$("action-dialog").close();await refresh();if(afterSuccess)await afterSuccess();}catch(e){$("action-error").textContent=e.message;}finally{b.disabled=false;}},action.cls||"secondary");$("action-buttons").append(b);}if(!$("action-dialog").open)$("action-dialog").showModal();}
 function startStrategy(s){beginStartFlow(s);}
 
-function stopStrategy(s){const pending=state.orders.filter(o=>o.strategy_id===s.id&&(!terminal.has(o.status)||o.unknown));actionDialog("停止策略：選擇未成交單處理",`${s.params.name} 有 ${pending.length} 筆在途／未知委託。兩種選項都會停止新單、保留已成交部位，不會平倉。`,[{text:"停止並保留未成交單",fn:()=>command("stop",{strategy_id:s.id,cancel:false})},{text:"停止並撤銷本策略委託",cls:"danger",fn:()=>command("stop",{strategy_id:s.id,cancel:true})}]);}
+function stopStrategy(s){return safe(async()=>{await takeOverRecovery(s);showStopStrategy(s);});}
+function showStopStrategy(s){const pending=state.orders.filter(o=>o.strategy_id===s.id&&(!terminal.has(o.status)||o.unknown));actionDialog("停止策略：選擇未成交單處理",`${s.params.name} 有 ${pending.length} 筆在途／未知委託。兩種選項都會停止新單、保留已成交部位，不會平倉。`,[{text:"停止並保留未成交單",fn:()=>command("stop",{strategy_id:s.id,cancel:false})},{text:"停止並撤銷本策略委託",cls:"danger",fn:()=>command("stop",{strategy_id:s.id,cancel:true})}]);}
 async function reconcile(s,resume=false){const result=await command("reconcile",{strategy_id:s.id});const body=el("div");body.append(el("p",result.explanation),el("p",`策略持股 ${result.position.quantity} 股；未知委託 ${result.unknown_orders} 筆。${result.matched?"目前帳本一致，可確認後重新啟動。":"存在差異或契約尚未驗證，暫不開放自動交易。"}`));body.append(el("pre",JSON.stringify(result.broker,null,2)));const actions=result.matched&&!result.unknown_orders?[{text:"確認對帳",cls:"primary",fn:()=>command("reconcile",{strategy_id:s.id,confirm:true,version:result.version})}]:[{text:"保留暫停",fn:async()=>{cancelStartFlow();}}];actionDialog("對帳與恢復",body,actions,resume?continueStartFlow:null);}
 function renderStrategies(){
  const list=$("strategies"),top=list.scrollTop,left=list.querySelector(".table-wrap")?.scrollLeft||0;list.replaceChildren();
@@ -61,7 +63,10 @@ function renderStrategies(){
    row.addEventListener("click",e=>{if(!e.target.closest("button"))pick();});
    row.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&e.target===row){e.preventDefault();pick();}});
    const name=el("div",undefined,"strategy-name");name.append(el("strong",s.params.name),el("small",modeNames[s.mode]));
-   if(s.reason)name.append(el("small",s.reason,"reason"));if(state.quote_warnings?.[s.id])name.append(el("small",state.quote_warnings[s.id],"reason"));
+   if(s.reason)name.append(el("small",s.reason,"reason"));
+   const recovery=state.recovery_status?.[s.id];
+   if(s.status==="paused"&&recovery){const hint=recovery.state==="retry_wait"?`監控已暫停；第 ${recovery.attempt} 次查核未通過，下次 ${timeLabel(recovery.retry_at)} 自動查核；差異排除後自動恢復，您也可接手。`:recovery.state==="checking"?"監控已暫停；正在背景查核，尚未恢復。":recovery.state==="connection_wait"?"監控已暫停；等待券商重連後查核。":recovery.state==="manual"?"監控已暫停；已交由您處理，背景查核與自動恢復已停止。":"";if(hint)name.append(el("small",hint,"reason"));}
+   if(s.status==="active"&&state.quote_warnings?.[s.id])name.append(el("small",state.quote_warnings[s.id],"reason"));
    const actions=el("div",undefined,"row-actions");
    actions.append(button("對帳",()=>safe(()=>reconcile(s))),button("編輯",()=>openStrategy(s)),button("封存",()=>actionDialog("封存策略","僅無部位、無在途委託且已停止的策略可封存。歷史仍保留。",[{text:"確認封存",fn:()=>command("archive",{strategy_id:s.id})}])));
    if(s.mode==="live"){

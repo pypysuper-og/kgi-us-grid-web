@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from copy import deepcopy
+from contextlib import contextmanager, nullcontext
 from datetime import date
 import hashlib
 import json
@@ -92,6 +93,7 @@ class Core:
             )
 
     def fail(self, sid, reason):
+        self.quote_warnings.pop(sid, None)
         current = self.store.strategy(sid)
         if (
             current
@@ -131,7 +133,21 @@ class Core:
         method = getattr(self, "cmd_" + action, None)
         if method is None:
             raise ValueError("不支援的操作")
-        return method(**payload)
+        if action != "recovery_takeover":
+            orders = self.store.orders() if action in {"retry_order", "fee"} else ()
+            self.recovery.take_over(self.recovery.manual_targets(action, payload, orders), action)
+        result = method(**payload)
+        if self.recovery.states and self.owner and not self.closing and not self.broker.disconnected.is_set():
+            self.recovery.update_stage(self.reconnect_resume or {"strategies": {}})
+        return result
+
+    def cmd_recovery_takeover(self, strategy_ids=None):
+        if strategy_ids is not None and (
+            not isinstance(strategy_ids, list) or any(not isinstance(sid, str) for sid in strategy_ids)
+        ):
+            raise ValueError("策略識別必須是文字清單")
+        ids = ["*"] if strategy_ids is None else strategy_ids
+        return {"taken_over": self.recovery.take_over(ids, "manual")}
 
     def cmd_preview(self, params, strategy_id=None, revision=None, reset_anchor=False):
         p = StrategyInput.model_validate(params)
@@ -175,6 +191,7 @@ class Core:
         return {"id": sid}
 
     def cmd_edit(self, strategy_id, params, revision, reset_anchor=False):
+        self.recovery.take_over([strategy_id], "edit")
         row, previous = self.params(strategy_id)
         p = StrategyInput.model_validate(params)
         if type(reset_anchor) is not bool:
@@ -235,6 +252,12 @@ class Core:
         return {"archived": True}
 
     def cmd_start(self, strategy_id, revision, confirm_live=False):
+        self.recovery.take_over([strategy_id], "start")
+        return self.start_strategy(strategy_id, revision, confirm_live)
+
+    def start_strategy(
+        self, strategy_id, revision, confirm_live=False, automatic=False, expected_generation=None
+    ):
         if self.fault:
             raise ValueError(self.fault)
         row, p = self.params(strategy_id)
@@ -256,16 +279,39 @@ class Core:
             if self.account_limit is None:
                 raise ValueError("請設定帳戶每日買入上限")
         rid = uuid.uuid4().hex
-        with self.store.transaction():
-            self.store.db.execute(
-                "INSERT INTO strategy_runs VALUES(?,?,?,?,NULL,NULL)",
-                (rid, strategy_id, revision, utcnow().isoformat()),
-            )
-            self.store.db.execute(
-                "UPDATE strategies SET status='active',run_id=?,reason='' WHERE id=?", (rid, strategy_id)
-            )
-            self.store.event("start", "策略已啟動；等待新行情", strategy_id)
+        guard = self.recovery.start_guard(strategy_id) if automatic else nullcontext(True)
+        with guard as allowed:
+            if automatic:
+                intent = self.reconnect_resume
+                same_account = (
+                    intent
+                    and intent["owner"] == self.owner
+                    and all(
+                        intent["selected"].get(k) == (self.broker.selected or {}).get(k)
+                        for k in ("account", "broker_id")
+                    )
+                )
+                if not allowed or not intent or strategy_id not in intent["strategies"]:
+                    self.recovery.take_over([strategy_id], "queued_manual_command")
+                    raise ValueError("使用者已接手；不再自動恢復")
+                if (
+                    not same_account
+                    or expected_generation != self.generation
+                    or self.broker.disconnected.is_set()
+                ):
+                    raise ValueError("會話或帳戶已改變；本次查核不能恢復監控")
+                self.audit.require_writable()
+            with self.store.transaction():
+                self.store.db.execute(
+                    "INSERT INTO strategy_runs VALUES(?,?,?,?,NULL,NULL)",
+                    (rid, strategy_id, revision, utcnow().isoformat()),
+                )
+                self.store.db.execute(
+                    "UPDATE strategies SET status='active',run_id=?,reason='' WHERE id=?", (rid, strategy_id)
+                )
+                self.store.event("start", "策略已啟動；等待新行情", strategy_id)
         self.quotes.pop(strategy_id, None)
+        self.quote_warnings.pop(strategy_id, None)
         return {"run_id": rid}
 
     def cmd_stop(self, strategy_id, cancel):
@@ -274,8 +320,8 @@ class Core:
         row, p = self.params(strategy_id)
         if cancel and p.mode == "live" and row["owner"] != f"live:{self.owner}":
             raise ValueError("不可透過其他帳戶撤單；請登入原委託帳戶")
-        if self.reconnect_resume is not None:
-            self.reconnect_resume["strategies"].pop(strategy_id, None)
+        self.recovery.take_over([strategy_id], "stop")
+        self.quote_warnings.pop(strategy_id, None)
         with self.store.transaction():
             self.store.db.execute(
                 "UPDATE strategies SET status='paused',reason=? WHERE id=?",
@@ -619,7 +665,12 @@ class Core:
                     report["broker_id"],
                     source_time=report.get("source_time", ""),
                 )
-                if report["status"] == "rejected" and (order["status"] != "rejected" or order["unknown"]):
+                terminal_stopped = mode == "live" and self.recovery.stop_for_terminal_report(order, report)
+                if (
+                    not terminal_stopped
+                    and report["status"] == "rejected"
+                    and (order["status"] != "rejected" or order["unknown"])
+                ):
                     self.fail(
                         order["strategy_id"],
                         "委託遭拒：" + (report.get("message") or "未取得原因，請查詢券商委託"),
@@ -748,6 +799,7 @@ class Core:
         return result
 
     def cmd_recovery_preview(self, strategy_ids=None, report_timezone=None):
+        self.recovery.take_over(["*"] if strategy_ids is None else strategy_ids, "recovery_preview")
         return self.recovery.preview(strategy_ids, report_timezone)
 
     def cmd_recovery_confirm(self, version, selections, confirm=False, start=False):
@@ -830,6 +882,10 @@ class Core:
         return {"order_id": after[-1]["id"], "status": after[-1]["status"], "previous_order_id": order_id}
 
     def cmd_reconcile(self, strategy_id, confirm=False, version=None):
+        self.recovery.take_over([strategy_id], "reconcile")
+        return self.reconcile_strategy(strategy_id, confirm, version)
+
+    def reconcile_strategy(self, strategy_id, confirm=False, version=None):
         row, p = self.params(strategy_id)
         if p.mode != "demo" and row["owner"] != f"{p.mode}:{self.owner}":
             raise ValueError("請先選定策略所屬帳戶")
@@ -914,6 +970,9 @@ class Core:
             raise ValueError("啟用欄位需為布林值")
         if not enable:
             self.live_armed = False
+            self.recovery.take_over(
+                [s["id"] for s in self.store.strategies() if s["mode"] == "live"], "disable"
+            )
             if self.reconnect_resume is not None:
                 self.reconnect_resume["armed"] = False
                 self.reconnect_resume["strategies"] = {
@@ -936,6 +995,10 @@ class Core:
             raise ValueError("請設定正數每日買入上限與1至100筆本次會話上限")
         if report_timezone not in (None, "Asia/Taipei", "America/New_York", "UTC"):
             raise ValueError("不支援的成交回報時區")
+        self.store.set_live_preferences(
+            self.owner,
+            {"daily_buy_limit": str(budget), "max_orders": max_orders, "report_timezone": report_timezone},
+        )
         self.account_limit = budget
         self.session_order_limit = self.session_order_count + max_orders
         self.broker.report_timezone = report_timezone
@@ -988,13 +1051,29 @@ class Core:
                     orders_used=self.session_order_count,
                     orders_limit=self.session_order_limit,
                 )
+            else:
+                # Retain blocked strategies and also capture monitors active before this new disconnect.
+                self.reconnect_resume["strategies"].update(
+                    {
+                        row["id"]: row
+                        for row in self.store.strategies()
+                        if row["status"] == "active"
+                        and row["mode"] != "demo"
+                        and row["owner"] == f"{row['mode']}:{self.owner}"
+                    }
+                )
             self.live_armed = False
             self.generation += 1
             self.quotes.clear()
             self.market.invalidate()
             self.stage = "券商斷線；等待重連後自動查核並恢復原監控"
             for sid in self.reconnect_resume["strategies"]:
+                state = self.recovery.states.setdefault(sid, {})
+                if self.store.strategy(sid)["status"] == "active":
+                    state["attempt"] = 0
                 self.fail(sid, "券商斷線；重連後自動查核並恢復監控")
+                state.update(state="connection_wait", retry_at=None, message="等待券商重連後查核")
+                self.recovery.retry_due.pop(sid, None)
             self.reconnect_due = now + 1
             self.broker.status(
                 phase="reconnect_wait",
@@ -1002,6 +1081,7 @@ class Core:
                 retry_at=utcnow().timestamp() + 1,
                 message="等待指數退避重連",
             )
+            self.recovery.publish()
         if now < self.reconnect_due:
             return
         self.reconnect_attempt += 1
@@ -1076,6 +1156,7 @@ class Core:
         # The caller still must obtain broker logout confirmation.
 
     def cmd_logout(self, cancel=False):
+        self.recovery.take_over(["*"], "logout")
         self.reconnect_resume = None
         for row in self.store.strategies():
             if (
@@ -1176,6 +1257,7 @@ class Core:
         if not isinstance(cancel, bool):
             raise ValueError("請明確選擇是否嘗試撤單")
         self.live_armed = False
+        self.recovery.take_over(["*"], "shutdown")
         self.reconnect_resume = None
         self.reconnect_enabled = False
         outcomes = {}
@@ -1233,6 +1315,7 @@ class Core:
         if self.broker.disconnected.is_set() and getattr(self.broker, "api", None):
             self.recover_connection()
             return
+        self.recovery.retry()
         if self.owner:
             self.update_market()
         if not self.owner or (time.monotonic() - self.last_poll < 3 and not self.broker.dirty.is_set()):
@@ -1293,6 +1376,7 @@ class Core:
             "audit_seq": audit_status["seq"],
             "audit_error": audit_status["error"],
             "ui_preferences": self.store.preferences(),
+            "live_preferences": self.store.live_preferences(self.owner),
             "updated_at": utcnow().isoformat(),
             "stage": self.stage,
             "generation": self.generation,
@@ -1330,6 +1414,7 @@ class Core:
                 }
             ),
             "reconciliation": deepcopy(self.reconciliation),
+            "recovery_status": self.recovery.snapshot(),
             "fault": self.fault,
             "closing": self.closing,
         }
@@ -1411,6 +1496,9 @@ class Service:
             self.results[request_id] = {"id": request_id, "status": "queued", "action": action}
             self.seen.add(request_id)
             self.audit.emit("command_received", command_id=request_id, action=action)
+            self.results[request_id]["recovery_targets"] = Recovery.manual_targets(
+                action, payload, self.state.get("orders", [])
+            )
             self.commands.put_nowait((request_id, action, payload))
         return request_id
 
@@ -1418,9 +1506,25 @@ class Service:
         with self.lock:
             return deepcopy(self.state)
 
+    @contextmanager
+    def recovery_guard(self, sid):
+        # Submission and automatic activation share this lock. No SDK call runs under it.
+        with self.lock:
+            allowed = not any(
+                row["status"] in {"queued", "running"}
+                and ("*" in row.get("recovery_targets", []) or sid in row.get("recovery_targets", []))
+                for row in self.results.values()
+            )
+            yield allowed
+
     def get_result(self, cid):
         with self.lock:
             return deepcopy(self.results.get(cid))
+
+    def publish_core(self, core):
+        state = core.snapshot()
+        with self.lock:
+            self.state = state
 
     def run(self):
         core = None
@@ -1435,6 +1539,8 @@ class Service:
             core.audit = self.audit
             core.broker.audit = self.audit
             core.store.audit = self.audit
+            core.recovery.start_guard = self.recovery_guard
+            core.recovery.publish = lambda: self.publish_core(core)
             self.state = core.snapshot()
             self.audit.emit("actor_ready", elapsed_seconds=round(time.monotonic() - initialized_at, 3))
             self.ready.set()

@@ -2,14 +2,24 @@
 // Navigation retains the selected strategy, never an implicit order/start permission.
 let startIntent=null;
 function cancelStartFlow(){startIntent=null;}
-function beginStartFlow(s){startIntent={id:s.id,revision:s.revision};safe(continueStartFlow);}
-function beginRetryFlow(s,o){startIntent={id:s.id,revision:s.revision,retry_order_id:o.id};safe(continueStartFlow);}
-function openLiveSettings(s=null){
- $("live-summary").textContent=(s?`啟動「${s.params.name}」：完成此步後返回對帳／啟動確認。 `:"")+(state?.selected?`${state.selected.broker_id} · ${state.selected.account}`:"尚未選帳")+" · "+(state?.live_reason||"");
+function beginStartFlow(s){startIntent={id:s.id,revision:s.revision};safe(async()=>{await takeOverRecovery(s);await continueStartFlow();});}
+function beginRetryFlow(s,o){startIntent={id:s.id,revision:s.revision,retry_order_id:o.id};safe(async()=>{await takeOverRecovery(s);await continueStartFlow();});}
+function openLiveSettings(s=null,targets=null){
+ const liveTargets=targets?.filter(row=>row.mode==="live")||[];
+ const context=targets?`本次查核 ${targets.length} 組策略：${targets.map(row=>row.params.name).join("、")}。其中 ${liveTargets.length} 組正式策略共用此帳戶的實單限制；完成後返回整批對帳／啟動確認。 `:s?`啟動「${s.params.name}」：此帳戶的正式策略共用實單限制；完成後返回對帳／啟動確認。 `:"此帳戶的正式策略共用實單限制。 ";
+ const status=state?.live_available?"實單已啟用":state?.selected?"實單尚未啟用，請核對下方限制並確認":"請先登入並選帳";
+ $("live-summary").textContent=context+(state?.selected?`${state.selected.broker_id} · ${state.selected.account}`:"尚未選帳")+" · "+status;
  const f=$("live-form");f.elements.confirm.checked=false;
  const limits=state?.live_limits,used=limits?.orders_used??0,remaining=Math.max(0,(limits?.orders_limit??0)-used);
  $("live-order-budget").textContent=`本次程式執行已用 ${used} 筆；${state?.live_available?`目前剩餘 ${remaining} 筆`:"目前實單未啟用"}。重新啟用時，剩餘額度會設為下方填寫的筆數。`;
- if(s&&!f.elements.daily_buy_limit.value)f.elements.daily_buy_limit.value=state.live_limits?.daily_buy_limit||s.params.daily_buy_limit;
+ const defaultStrategy=s||liveTargets[0];
+ if(state?.live_preferences!==undefined){
+  const saved=state.live_preferences;
+  f.elements.daily_buy_limit.value=saved.daily_buy_limit??limits?.daily_buy_limit??defaultStrategy?.params.daily_buy_limit??"";
+  f.elements.max_orders.value=saved.max_orders??1;
+  f.elements.report_timezone.value=saved.report_timezone??"";
+ }else if(defaultStrategy&&!f.elements.daily_buy_limit.value){f.elements.daily_buy_limit.value=limits?.daily_buy_limit||defaultStrategy.params.daily_buy_limit;}
+ $("live-preference-note").textContent=state?.live_preferences!==undefined?"成功確認後會記住此帳戶的金額、筆數與成交回報時區，下次自動帶入；每次仍需勾選確認啟用實單。":"每次啟用實單仍需核對此帳戶的交易限制並明確確認。";
  $("live-error").textContent="";if(!$("live-dialog").open)$("live-dialog").showModal();
 }
 async function continueStartFlow(){
