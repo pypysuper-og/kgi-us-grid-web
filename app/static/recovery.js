@@ -1,5 +1,5 @@
 "use strict";
-let recoveryIntent=null,recoveryPlan=null,recoveryBusy=false,recoveryContext=null;
+let recoveryIntent=null,recoveryPlan=null,recoveryBusy=false,recoveryContext=null,recoveryApplying=false,recoveryResultBusy=false,recoveryOutcome=null;
 function eligibleStrategies(){return state.strategies.filter(s=>s.status!=="archived"&&(s.mode==="demo"||s.owner===`${s.mode}:${state.owner}`));}
 async function openRecovery(ids=null,start=false,after=null){
  if(recoveryBusy)return;
@@ -21,7 +21,7 @@ async function openRecovery(ids=null,start=false,after=null){
 async function loadRecovery(){
  if(recoveryBusy||!recoveryContext)return;
  recoveryBusy=true;recoveryPlan=null;$("recovery-confirm").disabled=true;
- $("recovery-error").textContent="";$("recovery-results").replaceChildren();
+ $("recovery-error").textContent="";
  $("recovery-body").replaceChildren(el("p","正在讀取券商委託、成交與庫存，整理可配對項目…"));
  $("recovery-ack").checked=false;
  try{
@@ -50,21 +50,74 @@ async function loadRecovery(){
 $("recovery-refresh").addEventListener("click",()=>safe(loadRecovery,"recovery-error"));
 $("recovery-timezone").addEventListener("change",()=>safe(loadRecovery,"recovery-error"));
 $("recovery-ack").addEventListener("change",()=>{$("recovery-confirm").disabled=recoveryBusy||!recoveryPlan||!$("recovery-ack").checked;});
+async function recoveryResultAction(fn){
+ if(recoveryResultBusy)return;recoveryResultBusy=true;$("recovery-result-error").textContent="";
+ const controls=[...$("recovery-result-dialog").querySelectorAll("button")],disabled=controls.map(b=>b.disabled);
+ controls.forEach(b=>b.disabled=true);
+ try{await fn();}catch(e){$("recovery-result-error").textContent=e.message;}
+ finally{recoveryResultBusy=false;controls.forEach((b,i)=>b.disabled=disabled[i]);}
+}
+async function recoveryResultTargets(ids,context){
+ await refresh();
+ if(state.owner!==context.owner||state.generation!==context.generation)throw Error("帳戶會話已變更，請返回工作台重新查核。");
+ const targets=ids.map(id=>state.strategies.find(s=>s.id===id));
+ if(targets.some(s=>!s||s.status==="archived"||s.mode!=="demo"&&s.owner!==`${s.mode}:${state.owner}`))throw Error("策略或所屬帳戶已變更，請返回工作台重新查核。");
+ if(targets.some(s=>s.status==="active"))throw Error("其中策略目前已在監控，請返回工作台查看最新狀態。");
+ return targets;
+}
+function showRecoveryResult(result,context,updateError=""){
+ const rows=result.results,blocked=rows.filter(r=>r.status==="blocked"),active=rows.filter(r=>r.status==="active").length,reconciled=rows.filter(r=>r.status==="reconciled").length;
+ recoveryOutcome={ids:blocked.map(r=>r.id),context};
+ $("recovery-result-title").textContent=`${context.start?"恢復監控結果":"查核結果"}：${blocked.length?(active||reconciled?"部分完成":context.start?"尚未啟動":"仍需處理"):"已完成"}`;
+ $("recovery-result-summary").textContent=`本次結果 · 監控中 ${active} 組 · 已對帳 ${reconciled} 組 · 需處理 ${blocked.length} 組`;
+ $("recovery-result-error").textContent=updateError;
+ const body=$("recovery-result-body");body.replaceChildren();
+ for(const row of rows){
+  const needsAction=row.status==="blocked",card=el("section",undefined,`recovery-result-card${needsAction?" needs-action":""}`),head=el("div",undefined,"recovery-result-head");card.dataset.strategyId=row.id;
+  head.append(el("h3",row.name),el("span",needsAction?"需處理":row.status==="active"?"監控中":"已對帳",`pill${needsAction?" warn":""}`));
+  card.append(head,el("p",row.message));
+  if(needsAction){
+   const settings=/停止日期/.test(row.message),actions=el("div",undefined,"recovery-result-actions");
+   card.append(el("p",settings?"請核對並調整停止日期；儲存後重新查核與確認啟動。":"請核對阻擋原因，重新查核委託、成交與庫存後再確認。","help"));
+   actions.append(button(settings?"調整策略設定":"重新查核此策略",()=>recoveryResultAction(async()=>{
+    const [s]=await recoveryResultTargets([row.id],context);
+    if(settings){selected=s.id;render();await openStrategy(s);if($("strategy-dialog").open){const field=fieldInput("end_date");field.scrollIntoView({block:"center"});field.focus({preventScroll:true});}}
+    else{$("recovery-result-dialog").close();await openRecovery([s.id],context.start);}
+   })));
+   if(/分配後持股超過券商持股/.test(row.message))actions.append(button("交接既有部位",()=>recoveryResultAction(async()=>{const [s]=await recoveryResultTargets([row.id],context);openInventoryHandoff(null,s);})));card.append(actions);
+  }
+  body.append(card);
+ }
+ $("recovery-result-recheck").disabled=!blocked.length;
+ $("recovery-result-recheck").textContent=`重新查核待處理${blocked.length?`（${blocked.length} 組）`:"策略"}`;
+ if(!$("recovery-result-dialog").open)$("recovery-result-dialog").showModal();
+ $("recovery-result-title").focus({preventScroll:true});
+}
+$("recovery-result-recheck").addEventListener("click",()=>recoveryResultAction(async()=>{
+ const outcome=recoveryOutcome;if(!outcome?.ids.length)return;
+ const targets=await recoveryResultTargets(outcome.ids,outcome.context);
+ $("recovery-result-dialog").close();await openRecovery(targets.map(s=>s.id),outcome.context.start);
+}));
+$("recovery-result-dialog").addEventListener("close",()=>{recoveryOutcome=null;});
+$("recovery-result-dialog").addEventListener("cancel",e=>{if(recoveryResultBusy)e.preventDefault();});
+$("recovery-dialog").addEventListener("cancel",e=>{if(recoveryApplying)e.preventDefault();});
 $("recovery-confirm").addEventListener("click",async()=>{
  if(recoveryBusy||!recoveryPlan||!$("recovery-ack").checked)return;
- recoveryBusy=true;$("recovery-confirm").disabled=true;$("recovery-error").textContent="";
+ recoveryBusy=true;recoveryApplying=true;$("recovery-confirm").disabled=true;$("recovery-error").textContent="";
+ const context={...recoveryContext,owner:state.owner,generation:state.generation},close=document.querySelector('#recovery-dialog [data-close="recovery-dialog"]');close.disabled=true;
  const selections={};document.querySelectorAll("[data-recovery-order]").forEach(s=>selections[s.dataset.recoveryOrder]=s.value);
  try{
-  const result=await command("recovery_confirm",{version:recoveryPlan.version,selections,confirm:true,start:recoveryContext.start});
-  recoveryPlan=null;await refresh();
-  $("recovery-results").replaceChildren(table(["策略","結果"],result.results.map(r=>[r.name,r.message])));
-  if(result.results.length&&result.results.every(r=>r.status!=="blocked")&&(recoveryContext.after||recoveryContext.start&&result.results.every(r=>r.status==="active"))){
-   const {after:next,start}=recoveryContext;$("recovery-dialog").close();recoveryContext=null;
-   toast(`${start?"已恢復監控":"已完成對帳"} ${result.results.length} 組；詳情可查看策略事件與成交紀錄`);if(next)await next();
+  const result=await command("recovery_confirm",{version:recoveryPlan.version,selections,confirm:true,start:context.start});
+  recoveryPlan=null;$("recovery-ack").checked=false;
+  let updateError="";try{await refresh();}catch(e){updateError=`已收到本次查核結果；畫面更新失敗：${e.message}。請稍後返回工作台確認。`;}
+  $("recovery-dialog").close();recoveryContext=null;
+  const complete=result.results.length&&result.results.every(r=>r.status!=="blocked")&&(context.after||context.start&&result.results.every(r=>r.status==="active"));
+  if(!complete||updateError){
+   cancelStartFlow();recoveryIntent=null;showRecoveryResult(result,context,updateError);
   }
-  else toast(`完成 ${result.results.filter(r=>r.status!=="blocked").length} 組；待處理 ${result.results.filter(r=>r.status==="blocked").length} 組`);
+  else{toast(`${context.start?"已恢復監控":"已完成對帳"} ${result.results.length} 組；詳情可查看策略事件與成交紀錄`);if(context.after)await safe(context.after);}
  }catch(e){recoveryPlan=null;$("recovery-error").textContent=e.message+"；請按重新查核。";}
- finally{recoveryBusy=false;}
+ finally{recoveryBusy=false;recoveryApplying=false;close.disabled=false;}
 });
 const oldReconcile=reconcile;
 reconcile=async function(s,resume=false){
@@ -74,7 +127,7 @@ reconcile=async function(s,resume=false){
  if(resume&&!retry)cancelStartFlow();
 };
 async function offerResumeAfterLogin(){
- if(startIntent||recoveryIntent||$("recovery-dialog").open)return;
+ if(startIntent||recoveryIntent||$("recovery-dialog").open||$("recovery-result-dialog").open)return;
  const paused=eligibleStrategies().filter(s=>s.mode!=="demo"&&s.status==="paused");
  if(!paused.length)return;
  let resume=false;

@@ -90,6 +90,11 @@ def main():
                 import ctypes
 
                 reason = (
+                    "缺少 Microsoft Edge WebView2 Runtime。請由 Microsoft 官方安裝 Evergreen Runtime，\n"
+                    "或使用 start.vbs --browser 開啟瀏覽器模式。\n"
+                    "https://developer.microsoft.com/microsoft-edge/webview2/"
+                    if detail["reason"] == "webview2_runtime_missing"
+                    else
                     "工作台載入帳本／市場日曆逾時。"
                     if detail["reason"] == "timeout"
                     else "工作台啟動或背景收尾未完成。"
@@ -103,7 +108,7 @@ def main():
                     None,
                     f"{reason}\n階段：{detail['stage']}；原因：{detail['reason']}。\n"
                     f"{cleanup}\n請查看 logs/bootstrap.jsonl 與 runtime/logs 稽核紀錄。",
-                    "KGI 美股網格工作台",
+                    "美股網格工作台",
                     0x10,
                 )
         return 1

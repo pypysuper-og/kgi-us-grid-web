@@ -44,8 +44,54 @@ function Get-GridHealthWorkbench([object]$Health, [int]$Port, [string]$Runtime) 
         if (-not $Health -or $Health.product -ne 'kgi-us-grid-web' -or $Health.protocol -ne 1 -or
             $Health.ready -ne $true -or $Health.runtime_id -ne (Get-GridRuntimeId $Runtime) -or
             [string]$Health.instance -notmatch '^[a-f0-9]{32}$' -or [int]$Health.pid -le 0) { return $null }
-        return @{ url = "http://127.0.0.1:$Port/"; backend_pid = [int]$Health.pid; instance = [string]$Health.instance; identity = 'health' }
+        return @{ url = "http://127.0.0.1:$Port/"; backend_pid = [int]$Health.pid; instance = [string]$Health.instance; identity = 'health'; presentation_mode = [string]$Health.presentation_mode; desktop_ready = [bool]$Health.desktop_ready }
     } catch { return $null }
+}
+
+function Get-GridLegacyListenerOwners([int]$Port) {
+    # Legacy HTTP servers have no health identity. Read the OS listener-owner table
+    # when the NetTCPIP provider cannot identify a live loopback listener.
+    # Modern health discovery bypasses this helper; retire it with legacy support.
+    $connections = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if ($connections.Count) { return @($connections | ForEach-Object { [int]$_.OwningProcess }) }
+    if (-not ('GridStartupTcpOwner' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class GridStartupTcpOwner {
+    [DllImport("iphlpapi.dll")]
+    private static extern uint GetExtendedTcpTable(IntPtr table, ref uint size, bool order, uint family, uint kind, uint reserved);
+    public static int[] LoopbackListeners(int port) {
+        uint size = 0;
+        uint status = GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 3, 0);
+        if (status != 122 || size < 4) return new int[0];
+        for (int attempt = 0; attempt < 2; attempt++) {
+            IntPtr table = Marshal.AllocHGlobal(checked((int)size));
+            try {
+                status = GetExtendedTcpTable(table, ref size, false, 2, 3, 0);
+                if (status == 122) continue;
+                if (status != 0) return new int[0];
+                int count = Marshal.ReadInt32(table);
+                if (count < 0 || count > (size - 4) / 24) return new int[0];
+                var owners = new List<int>();
+                for (int i = 0; i < count; i++) {
+                    int offset = 4 + i * 24;
+                    int address = Marshal.ReadInt32(table, offset + 4);
+                    int rawPort = Marshal.ReadInt32(table, offset + 8);
+                    int localPort = ((rawPort & 255) << 8) | ((rawPort >> 8) & 255);
+                    if (address == 0x0100007f && localPort == port)
+                        owners.Add(Marshal.ReadInt32(table, offset + 20));
+                }
+                return owners.ToArray();
+            } finally { Marshal.FreeHGlobal(table); }
+        }
+        return new int[0];
+    }
+}
+'@
+    }
+    return [GridStartupTcpOwner]::LoopbackListeners($Port)
 }
 
 function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
@@ -66,10 +112,10 @@ function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
         if (-not $session -or [string]$session.instance -notmatch '^[a-f0-9]{32}$' -or
             [string]$session.version -notmatch '^\d+\.\d+\.\d+') { return $null }
         $page = Invoke-GridStartupProbe $url
-        if (-not $page -or $page -notmatch '<title>KGI 美股網格工作台</title>') { return $null }
-        $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        if (-not $page -or $page -notmatch '<title>(?:KGI )?美股網格工作台</title>') { return $null }
+        $listeners = @(Get-GridLegacyListenerOwners -Port $Port)
         if ($listeners.Count -ne 1) { return $null }
-        $backendPid = [int]$listeners[0].OwningProcess
+        $backendPid = [int]$listeners[0]
         $process = Get-CimInstance Win32_Process -Filter "ProcessId=$backendPid" -OperationTimeoutSec 2
         $entry = [regex]::Escape((Join-Path $PSScriptRoot 'launch.pyw'))
         if (-not $process -or $process.CommandLine -notmatch ($entry + '(?="|\s|$)')) { return $null }
@@ -93,16 +139,40 @@ function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
     return $null
 }
 
-function Open-ExistingGridWorkbench([hashtable]$Existing, [string]$Runtime = '', [switch]$NoBrowser) {
+function Open-ExistingGridWorkbench([hashtable]$Existing, [string]$Runtime = '', [switch]$NoBrowser, [switch]$Browser) {
     $logs = Join-Path (Split-Path -Parent (Get-GridRuntime $Runtime)) 'logs'
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
     $script:SetupLog = Join-Path $logs 'bootstrap.jsonl'
     $script:SetupStage = 'open_existing'
     try {
-        # The browser is the requested visible UI; no new backend or console is launched.
-        if (-not $NoBrowser) { Start-Process -FilePath $Existing.url }
+        if (-not $NoBrowser) {
+            if ($Existing.presentation_mode -eq 'desktop' -and -not $Browser) {
+                $deadline = [DateTime]::UtcNow.AddSeconds(45)
+                while (-not $Existing.desktop_ready -and [DateTime]::UtcNow -lt $deadline) {
+                    Set-SetupProgress '桌面視窗仍在載入，正在等待既有視窗。'
+                    [Threading.Thread]::Sleep(200)
+                    $current = Find-ExistingGridWorkbench -Port ([uri]$Existing.url).Port -Runtime $Runtime
+                    if (-not $current -or $current.instance -ne $Existing.instance) { throw 'Existing instance changed' }
+                    $Existing = $current
+                }
+                if (-not $Existing.desktop_ready) { throw 'Desktop readiness timeout' }
+                Add-Type -AssemblyName System.Net.Http
+                $handler = New-Object Net.Http.HttpClientHandler
+                $handler.UseProxy = $false; $handler.AllowAutoRedirect = $false
+                $client = New-Object Net.Http.HttpClient($handler)
+                $client.Timeout = [TimeSpan]::FromSeconds(5)
+                try {
+                    $session = $client.GetStringAsync($Existing.url + 'api/session').GetAwaiter().GetResult() | ConvertFrom-Json
+                    if ($session.instance -ne $Existing.instance) { throw 'Existing instance changed' }
+                    $client.DefaultRequestHeaders.Add('X-Grid-Token', [string]$session.token)
+                    $content = New-Object Net.Http.StringContent('{}', [Text.Encoding]::UTF8, 'application/json')
+                    $response = $client.PostAsync($Existing.url + 'api/desktop/activate', $content).GetAwaiter().GetResult()
+                    $response.EnsureSuccessStatusCode() | Out-Null
+                } finally { $client.Dispose() }
+            } else { Start-Process -FilePath $Existing.url }
+        }
     } catch {
-        $script:SetupDetail = "工作台仍在運行；瀏覽器未能自動開啟，請手動開啟 $($Existing.url)"
+        $script:SetupDetail = "工作台仍在運行；介面未能自動開啟，請稍後再試，或使用 --browser 開啟 $($Existing.url)"
         Write-SetupEvent $script:SetupLog 'workbench_browser_failed' @{ port = ([uri]$Existing.url).Port; backend_pid = $Existing.backend_pid }
         throw
     }
@@ -287,7 +357,7 @@ function Set-SetupProgress([string]$Text, [switch]$NoUI) {
     if (-not $script:SetupForm) {
         Add-Type -AssemblyName System.Windows.Forms
         $script:SetupForm = New-Object Windows.Forms.Form
-        $script:SetupForm.Text = 'KGI 美股網格工作台：正在啟動'
+        $script:SetupForm.Text = '美股網格工作台：正在啟動'
         $script:SetupForm.ClientSize = New-Object Drawing.Size(720, 390)
         $script:SetupForm.StartPosition = 'CenterScreen'
         $script:SetupForm.FormBorderStyle = 'FixedDialog'
@@ -335,7 +405,7 @@ function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$
     $script:SetupStage = 'server_startup'
     $script:SetupCanCancel = $false
     if ($script:SetupCancel) { $script:SetupCancel.Text = '隱藏提示' }
-    if ($script:SetupNote) { $script:SetupNote.Text = '完成後自動開啟瀏覽器；隱藏提示只收起此視窗，程式繼續啟動。' }
+    if ($script:SetupNote) { $script:SetupNote.Text = '完成後自動開啟桌面工作台或所選瀏覽器；隱藏提示只收起此視窗，程式繼續啟動。' }
     Set-SetupProgress '環境已就緒；正在載入市場日曆與帳本。完成後會自動開啟工作台。'
     $started = [DateTime]::UtcNow
     # One owned launch, one finite readiness deadline; never kill or relaunch on timeout.
@@ -353,7 +423,7 @@ function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$
         $health = $null
         if ($healthText) { try { $health = $healthText | ConvertFrom-Json } catch { } }
         $ready = Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
-        if ($ready) {
+        if ($ready -and ($ready.presentation_mode -ne 'desktop' -or $ready.desktop_ready)) {
             Write-SetupEvent $script:SetupLog 'workbench_ready' @{
                 backend_pid = $ready.backend_pid; port = $Port
                 elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
@@ -455,7 +525,7 @@ function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switc
         if ($Repair) { $arguments += '--reinstall' }
         if ($needsSync) {
             $script:SetupStage = 'environment_sync'
-            Set-SetupProgress '正在準備 Python 3.12 與鎖定套件（含 SuperPy）；以下顯示即時安裝訊息。' -NoUI:$NoUI
+            Set-SetupProgress '正在準備 Python 3.12 與鎖定套件（含券商 SDK）；以下顯示即時安裝訊息。' -NoUI:$NoUI
             $script:SetupDetail = ''
             $null = Invoke-SetupProcess $UvPath $arguments $log $script:SetupStage -ShowOutput
         }
@@ -482,5 +552,5 @@ function Show-SetupFailure([switch]$NoUI) {
     }
     if ($NoUI) { Write-Host $message; return }
     Add-Type -AssemblyName System.Windows.Forms
-    [Windows.Forms.MessageBox]::Show($message, 'KGI 美股網格工作台', 'OK', 'Error') | Out-Null
+    [Windows.Forms.MessageBox]::Show($message, '美股網格工作台', 'OK', 'Error') | Out-Null
 }

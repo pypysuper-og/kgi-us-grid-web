@@ -1,5 +1,6 @@
 from .audit import observed
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -14,12 +15,17 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ui_preferences(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS live_preferences(owner TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS editor_library(
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('draft','template')), title TEXT NOT NULL,
+ data TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS application_preferences(
+ id INTEGER PRIMARY KEY CHECK(id=1), presentation_mode TEXT NOT NULL CHECK(presentation_mode IN ('desktop','browser')));
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts(owner TEXT PRIMARY KEY, mode TEXT NOT NULL, identity TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS strategies(
@@ -50,6 +56,10 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,time TEXT
  strategy_id TEXT,kind TEXT NOT NULL,message TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS orders_strategy ON orders(strategy_id);
 CREATE INDEX IF NOT EXISTS fills_time ON fills(time);
+CREATE INDEX IF NOT EXISTS fills_strategy ON fills(strategy_id);
+CREATE INDEX IF NOT EXISTS events_strategy ON events(strategy_id,id);
+CREATE INDEX IF NOT EXISTS orders_pending ON orders(strategy_id)
+ WHERE status NOT IN ('filled','canceled','rejected','expired') OR unknown<>0;
 CREATE TRIGGER IF NOT EXISTS fills_no_update BEFORE UPDATE ON fills BEGIN SELECT RAISE(ABORT,'append only'); END;
 CREATE TRIGGER IF NOT EXISTS fills_no_delete BEFORE DELETE ON fills BEGIN SELECT RAISE(ABORT,'append only'); END;
 CREATE TRIGGER IF NOT EXISTS ledger_no_update BEFORE UPDATE ON ledger_entries BEGIN SELECT RAISE(ABORT,'append only'); END;
@@ -93,8 +103,29 @@ class Store:
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1,?)", (utcnow().isoformat(),))
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(2,?)", (utcnow().isoformat(),))
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(3,?)", (utcnow().isoformat(),))
+        # Older applications cannot interpret ownership handoffs; reject downgrade.
+        self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(4,?)", (utcnow().isoformat(),))
+        # Earlier applications would ignore a simulated-position retirement.
+        self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(5,?)", (utcnow().isoformat(),))
         self.db.execute("INSERT OR IGNORE INTO accounts VALUES('demo','demo','離線展示')")
         self.db.commit()
+        # Connection-local display cache only. Trading/report queries remain fresh.
+        # SQLite rolls this revision back with the data; never cache inside a transaction.
+        self._summary_cache = None
+        self._summary_key = None
+        self.db.executescript("CREATE TEMP TABLE display_revision(value INTEGER NOT NULL); INSERT INTO display_revision VALUES(0);")
+        for name, operation, condition in (
+            ("strategy_insert", "INSERT ON strategies", ""),
+            ("strategy_delete", "DELETE ON strategies", ""),
+            ("strategy_params", "UPDATE OF params,owner,mode ON strategies", ""),
+            ("fill", "INSERT ON fills", ""),
+            ("ledger", "INSERT ON ledger_entries", "WHEN NEW.kind IN ('opening','opening_cost','fee','inventory_handoff','simulation_exit')"),
+            ("settlement", "UPDATE OF settlement_currency ON orders", ""),
+        ):
+            self.db.execute(
+                f"CREATE TEMP TRIGGER display_{name} AFTER {operation} {condition} "
+                "BEGIN UPDATE display_revision SET value=value+1; END"
+            )
 
     @contextmanager
     def transaction(self):
@@ -182,6 +213,51 @@ class Store:
             self.rows("SELECT * FROM ledger_entries ORDER BY id"),
             day,
         )
+
+    def report_summary(self):
+        key = (self.db.execute("PRAGMA data_version").fetchone()[0],
+               self.db.execute("SELECT value FROM display_revision").fetchone()[0])
+        transactional = self.db.in_transaction
+        if transactional or key != self._summary_key:
+            report = self.report()
+            report.pop("fill_details")
+            report["summary_only"] = True
+            if transactional:
+                return report
+            self._summary_cache, self._summary_key = report, key
+        return deepcopy(self._summary_cache)
+
+    def display_orders(self):
+        pending = self.rows("SELECT * FROM orders WHERE status NOT IN ('filled','canceled','rejected','expired') OR unknown<>0")
+        recent = self.rows("SELECT * FROM orders ORDER BY rowid DESC LIMIT 50")
+        latest = self.rows(
+            "SELECT o.* FROM strategies s JOIN orders o ON o.rowid="
+            "(SELECT MAX(rowid) FROM orders WHERE strategy_id=s.id)"
+        )
+        return sorted({o["id"]: o for o in pending + recent + latest}.values(), key=lambda o: (o["created_at"], o["id"]))
+
+    def recent_fills(self):
+        return self.rows("SELECT f.*,o.settlement_currency FROM fills f JOIN orders o ON o.id=f.order_id ORDER BY f.rowid DESC LIMIT 50")
+
+    def history(self, sid, kind, before=None, limit=50):
+        if kind not in {"orders", "fills", "events"} or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("歷史類型或每頁筆數不符")
+        if before is not None and (type(before) is not int or before < 1):
+            raise ValueError("歷史頁碼不符，請回到最新一頁")
+        args = [sid]
+        if kind == "fills":
+            sql = "SELECT f.rowid AS history_cursor,f.*,o.settlement_currency FROM fills f JOIN orders o ON o.id=f.order_id WHERE f.strategy_id=?"
+            cursor = "f.rowid"
+        else:
+            sql = f"SELECT rowid AS history_cursor,* FROM {kind} WHERE " + ("(strategy_id=? OR strategy_id IS NULL)" if kind == "events" else "strategy_id=?")
+            cursor = "rowid"
+        if before is not None:
+            sql += f" AND {cursor}<?"
+            args.append(before)
+        args.append(limit + 1)
+        rows = self.rows(sql + f" ORDER BY {cursor} DESC LIMIT ?", args)
+        more = len(rows) > limit
+        return {"rows": rows[:limit], "next": rows[limit - 1]["history_cursor"] if more else None}
 
     def fills(self):
         return self.rows(
@@ -480,6 +556,10 @@ class Store:
             self.event("fee", "已追加美元費用核對／更正，損益將重算", order["strategy_id"])
 
     def set_opening_cost(self, sid, amount, reason):
+        if any(json.loads(r["data"]).get("duplicate_replaced") for r in self.rows(
+            "SELECT data FROM ledger_entries WHERE strategy_id=? AND kind='inventory_handoff_ref'", (sid,)
+        )):
+            raise ValueError("此策略的重複期初登記已由交接更正；請在原策略補正期初成本")
         if not self.rows("SELECT id FROM ledger_entries WHERE strategy_id=? AND kind='opening'", (sid,)):
             raise ValueError("此策略沒有期初部位")
         amount = decimal(amount)

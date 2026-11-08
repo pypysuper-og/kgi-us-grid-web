@@ -18,13 +18,13 @@ def project(strategies, fills, ledger, day=None):
             fees[data["order_id"]] = data
         elif row["kind"] == "opening_cost":
             opening_costs[row["strategy_id"]] = data["cost"]
-        elif row["kind"] == "opening":
+        elif row["kind"] in {"opening", "inventory_handoff", "simulation_exit"}:
             entries.append(
                 {
                     **data,
                     "strategy_id": row["strategy_id"],
                     "time": row["time"],
-                    "side": "opening",
+                    "side": {"opening": "opening", "inventory_handoff": "handoff", "simulation_exit": "simulation_exit"}[row["kind"]],
                     "order_id": None,
                 }
             )
@@ -50,6 +50,8 @@ def project(strategies, fills, ledger, day=None):
     result = {}
     daily = defaultdict(lambda: {"realized": ZERO, "known": True, "buy_value": ZERO, "sell_value": ZERO})
     limit_buys = defaultdict(lambda: ZERO)
+    handoffs = defaultdict(list)
+    replaced_openings = set()
     for entry in entries:
         sid = entry["strategy_id"]
         if sid not in configs:
@@ -59,6 +61,40 @@ def project(strategies, fills, ledger, day=None):
             {"quantity": 0, "cost": ZERO, "realized": ZERO, "realized_known": True, "fees_complete": True},
         )
         qty = entry["quantity"]
+        if entry["side"] == "simulation_exit":
+            if configs[sid]["mode"] not in {"demo", "paper"} or qty <= 0 or qty != state["quantity"]:
+                raise ValueError("模擬結束紀錄與策略部位不符，需核對帳本")
+            state["quantity"], state["cost"] = 0, ZERO
+            continue
+        if entry["side"] == "handoff":
+            target = entry["target_id"]
+            if target not in configs or configs[target]["owner"] != configs[sid]["owner"] or configs[target]["params"]["symbol"] != configs[sid]["params"]["symbol"]:
+                raise ValueError("交接來源與目的身份不符，需核對帳本")
+            destination = result.setdefault(target, {"quantity": 0, "cost": ZERO, "realized": ZERO, "realized_known": True, "fees_complete": True})
+            if entry["duplicate_replaced"]:
+                if destination["quantity"] != entry["discarded_quantity"]:
+                    raise ValueError("交接前目的期初登記已變動，需核對帳本")
+                destination["quantity"], destination["cost"] = 0, ZERO
+                replaced_openings.add(target)
+            if qty <= 0 or qty > state["quantity"]:
+                raise ValueError("交接股數超過已歸屬部位，需對帳")
+            # Derive cost at this ledger event, so later fee/opening-cost evidence
+            # propagates through the handoff without rewriting its historical receipt.
+            transferred_cost = state["cost"] if qty == state["quantity"] else None if state["cost"] is None else state["cost"] * qty / state["quantity"]
+            state["quantity"] -= qty
+            if state["cost"] is not None:
+                state["cost"] -= transferred_cost
+            if not state["quantity"]:
+                state["cost"] = ZERO
+            destination["quantity"] += qty
+            destination["cost"] = None if destination["cost"] is None or transferred_cost is None else destination["cost"] + transferred_cost
+            destination["fees_complete"] &= state["fees_complete"]
+            if sid in provisional:
+                provisional.add(target)
+            handoffs[target].append({"source_id": sid, "source_name": entry["source_name"], "quantity": qty,
+                                    "cost_at_confirmation": entry["source_cost_at_confirmation"],
+                                    "operation_id": entry["operation_id"], "time": entry["time"]})
+            continue
         dated = entry.get("time_quality", "source") == "source"
         d = datetime.fromisoformat(entry["time"]).astimezone(ET).date().isoformat() if dated else None
         bucket = daily[(sid, d)]
@@ -137,6 +173,8 @@ def project(strategies, fills, ledger, day=None):
                 "fees_complete": state["fees_complete"],
                 "buy_value": str(sum((v["buy_value"] for v in filtered), ZERO)),
                 "sell_value": str(sum((v["sell_value"] for v in filtered), ZERO)),
+                "handoffs": handoffs[sid],
+                "opening_replaced": sid in replaced_openings,
             }
         )
     settlement = {}

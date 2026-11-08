@@ -23,6 +23,7 @@ MODULES = (
     "paramiko",
     "tqdm",
     "websocket",
+    "webview",
 )
 
 
@@ -60,6 +61,8 @@ def check(verify=False):
             raise ValueError("environment_changed")
     if metadata.version("kgisuperpy") != "2.1.2":
         raise ValueError("broker_version")
+    if metadata.version("pywebview") != "6.2.1":
+        raise ValueError("desktop_version")
     for name in MODULES:
         if util.find_spec(name) is None:
             raise ModuleNotFoundError(name)
@@ -107,6 +110,8 @@ def main():
             "broker_version",
             "invalid_arguments",
             "verify_required",
+            "desktop_version",
+            "webview2_runtime_missing",
         }
         reason = str(exc) if isinstance(exc, ValueError) and str(exc) in known else "dependency_check_failed"
         print(json.dumps({"ready": False, "error_type": type(exc).__name__, "reason": reason}))

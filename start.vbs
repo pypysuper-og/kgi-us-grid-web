@@ -9,6 +9,7 @@ For Each argument In WScript.Arguments
         Case "--port": argument = "-Port"
         Case "--runtime": argument = "-Runtime"
         Case "--no-browser": argument = "-NoBrowser"
+        Case "--browser": argument = "-Browser"
     End Select
     command = command & " """ & Replace(argument, """", """""") & """"
 Next

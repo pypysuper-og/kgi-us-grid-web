@@ -1,13 +1,16 @@
 "use strict";
 // One form and one backend preview for both editing paths; no duplicate strategy math.
 const editorSteps=[
- ["商品與模式",["name","symbol","mode","direction"]],
- ["價格與格線",["lower_price","upper_price","start_price","gap","gap_unit","pause_buys_below_lower"]],
- ["部位與限制",["quantity","min_inventory","max_inventory","initial_inventory","initial_cost","opening_confirmed","max_order_value","daily_buy_limit","end_date","currency","quote_max_age"]],
+ ["商品與模式",["name","symbol","mode"]],
+ ["價格範圍",["lower_price","upper_price"]],
+ ["格子數",["start_price","gap","gap_unit"]],
+ ["股數與結算",["quantity","max_inventory","currency","end_date","initial_inventory","initial_cost","opening_confirmed","direction","min_inventory","max_order_value","daily_buy_limit","quote_max_age","pause_buys_below_lower"]],
  ["預覽與確認",[]]
 ];
 let wizard=false,wizardStep=0,editorEpoch=0,lookupRevision=0,lookupTimer=null,editorConsumer=null,verifiedSymbol=null,layoutResult=null,editorBusy=false;
 let layoutBasis="count",layoutTimer=null,layoutRevision=0;
+let rangeTouched=false,rangeSeeded=false;
+let editorPreview=null;
 const fieldInput=name=>$("strategy-form").elements.namedItem(name);
 const marketStates={subscribing:"訂閱中",waiting:"等待本次訂閱首筆成交",receiving:"已接收參考資料・等待新成交",live:"有效成交",stale:"已過期・最後資料僅供參考",time_unverified:"來源時區未知",disconnected:"已斷線・等待重連",error:"行情查核／訂閱異常",unavailable:"訂閱不可用"};
 function marketText(entry,symbol){
@@ -31,13 +34,13 @@ HELP.parameters=["總體參數設定與 CLOV 案例",[
  "方向：雙邊買賣／單邊買／單邊賣。只賣已有持股、不放空。每筆股數是每次委託股數；期初股數是分配給策略的既有庫存，不會啟動即買入。",
  "CLOV 案例：起始 4.50、下界 4.00、上界 5.00、固定間距 0.02。整個範圍有 50 個價格間隔、51 個價位；起始價是初始基準，不是立即成交價。",
  "基準 4.50、零持股：跌到 4.48 觸發買 1 股；該單全部成交才將基準移至委託格價 4.48。之後跌到 4.46 可再買，或漲到 4.50 可賣。若零持股先漲至 4.52，不會賣空。",
- "最少保留 0、最多持股 20、期初 0、每筆 1 股：持續下跌且逐筆全部成交時，第 20 筆在 4.10 即碰到持股上限，不會繼續買到 4.00。反彈賣出後才釋放額度。預覽只列部位允許的委託，不是一次掛滿格子。",
+ "若進階選用最少保留 0、最多持股 20、期初 0、每筆 1 股：持續下跌且逐筆全部成交時，第 20 筆在 4.10 即碰到持股上限，不會繼續買到 4.00。反彈賣出後才釋放額度。預覽只列部位允許的委託，不是一次掛滿格子。",
  "固定金額以 USD 計；百分比以起始價換算一次固定價差，不隨成交複利重算。自動劃格：間距＝（上界－下界）÷ 格子數。預設起始價為中點，可改；中點或自訂價未落在上下界格線時，實際格線以起始價平移並明示。",
  "連動：改格數會依上下界重算間距；改間距則固定上下界反算格數。改上下界沿用最近選定的計算方式。直接改起始價會停止跟隨中點；可勾選恢復。5.50～7.00 分20格得到0.075，未符合美分精度；可套用15格／0.10或25格／0.06。不會暗中四捨五入。",
  "買價下界／賣價上界預設限制委託限價；例如下界5.50、買單限價5.53，市場5.30仍可能成交在5.30。可勾選『行情低於下界時不新增買單』，回到範圍自動繼續；不會撤銷已送單，也不保證成交價位於界線內。不是停損或自動平倉。",
  "編輯預設保留目前網格基準及部位。例：SOUN起始6.00、間距0.03，買在5.97後只提高每日預算，下一買點仍是5.94，不能重買5.97。只有明確勾選『重設基準為本次起始價』才重設；改間距沿用目前基準。預覽使用本次選定基準及目前持股，儲存不自動啟動。",
  "期初總成本是既有部位合計美元成本，不是每股成本；未知留空，不當成 0。勾選來源確認不是實單開關。",
- "單筆最大金額限制價格×股數，買賣皆適用；每日買入上限按美東成交日累計，不因賣出扣回、不含後補費用。正式交易另受本次會話的帳戶限制。",
+ "進階持股上限與金額限制留空不啟用；既有策略的明確限制仍保留。選用金額限制時，單筆最大金額限制價格×股數，買賣皆適用；每日買入上限按美東成交日累計，不因賣出扣回、不含後補費用。帳戶共用額度及筆數也在實單確認的進階項目選填。",
  "停止日期以台灣時間含當日；到期只停新單，委託與持股不會自動消失。結算選 TWD 仍以 USD 計算股價、成本、格距與金額限制。行情有效秒數是資料時效門檻，不是更新頻率。",
  "4.48 買 1 股、4.50 賣 1 股僅是 USD 0.02 毛價差，未扣交易費用。任何預覽都不是獲利保證。"
 ]];
@@ -50,12 +53,18 @@ HELP.market=["商品查核與動態行情",[
 ]];
 
 const marketBox=el("section",undefined,"editor-market");marketBox.id="editor-market";
-const marketTitle=el("div",undefined,"editor-toolbar");marketTitle.append(el("strong","商品查核與最新行情"),helpButton("market"),button("重新查核",()=>safe(lookupEditor,"symbol-status")),button("帳戶與連線",()=>{$("login-dialog").showModal();renderConnection();}));
+const marketTitle=el("div",undefined,"editor-toolbar"),marketRefresh=button("重新查核",()=>safe(lookupEditor,"symbol-status"));marketRefresh.id="market-refresh";
+marketTitle.append(el("strong","商品行情參考"),helpButton("market"),marketRefresh,button("帳戶與連線",()=>{$("login-dialog").showModal();renderConnection();}));
 const symbolStatus=el("p","請輸入商品代號。","help");symbolStatus.id="symbol-status";symbolStatus.setAttribute("role","status");
 const symbolQuote=el("p",undefined,"help");symbolQuote.id="symbol-quote";
-marketBox.append(marketTitle,symbolStatus,symbolQuote,el("p","行情時間自動辨識來源 timestamp／時區。缺少時區仍顯示原時間及價格，標示時區未知。","help"));
-$("strategy-form").querySelector(".form-grid").append(marketBox);
-const priceGrid=$("strategy-form").querySelector(".form-grid"),startLabel=fieldInput("start_price").closest("label");
+const quoteHeadline=el("div",undefined,"quote-headline"),quotePrice=el("strong","—"),quoteKind=el("span","尚未取得行情"),quoteProduct=el("span","商品未選擇","quote-product");quotePrice.id="reference-price";quoteKind.id="reference-kind";quoteProduct.id="reference-product";
+quoteHeadline.append(quoteProduct,quotePrice,el("span","USD","quote-currency"),quoteKind);
+const rangeSuggest=button("以參考價帶入約 ±10% 區間",()=>suggestRange(true));rangeSuggest.id="suggest-range";rangeSuggest.disabled=true;
+const seedNote=el("span","無行情時可手動設定，不影響離線演練。","help");seedNote.id="range-seed-note";
+const referenceActions=el("div",undefined,"editor-toolbar");referenceActions.append(rangeSuggest,seedNote);
+marketBox.append(marketTitle,quoteHeadline,symbolStatus,symbolQuote,referenceActions);
+$("editor-scroll").before(marketBox);
+const priceGrid=$("advanced-fields"),startLabel=fieldInput("start_price").closest("label");
 const lowerGuard=el("label",undefined,"check"),lowerGuardInput=el("input");
 lowerGuardInput.type="checkbox";lowerGuardInput.name="pause_buys_below_lower";
 lowerGuard.append(lowerGuardInput,el("span","行情低於下界時不新增買單（回到範圍自動繼續，已送單不撤銷）"));
@@ -66,12 +75,12 @@ anchorChoice.append(resetAnchor,el("span","重設基準為本次起始價（未�
 const anchorSummary=el("p",undefined,"help");anchorSummary.id="anchor-edit-summary";
 anchorEdit.append(anchorChoice,anchorSummary);
 priceGrid.insertBefore(anchorEdit,startLabel);
-for(const name of ["lower_price","upper_price"])priceGrid.insertBefore(fieldInput(name).closest("label"),startLabel);
-priceGrid.insertBefore($("auto-grid"),startLabel);
+$("basic-fields").insertBefore($("auto-grid"),fieldInput("quantity").closest("label"));
+priceGrid.prepend($("auto-enabled").closest("label"),$("midpoint-choice"));
 const layoutSuggestions=el("div",undefined,"editor-toolbar");layoutSuggestions.id="layout-suggestions";$("auto-options").append(layoutSuggestions);
 
 function releaseEditorConsumer(){const old=editorConsumer;editorConsumer=null;if(old)safe(()=>command("market_watch",{consumer:old,release:true}));}
-function invalidateSymbol(){lookupRevision++;verifiedSymbol=null;clearTimeout(lookupTimer);releaseEditorConsumer();$("symbol-status").textContent="商品已變更，等待查核。";$("symbol-quote").textContent="";}
+function invalidateSymbol(){lookupRevision++;verifiedSymbol=null;clearTimeout(lookupTimer);releaseEditorConsumer();$("symbol-status").textContent="商品已變更，等待查核。";$("symbol-quote").textContent="";renderEditorMarket();}
 async function lookupEditor(){
  const symbol=fieldInput("symbol").value.trim().toUpperCase(),revision=++lookupRevision,epoch=editorEpoch;
  releaseEditorConsumer();verifiedSymbol=null;
@@ -90,47 +99,104 @@ function renderEditorMarket(){
  if(!$("strategy-dialog").open)return;
  const symbol=fieldInput("symbol").value.trim().toUpperCase();
  if(verifiedSymbol&&(verifiedSymbol.generation!==state.generation||!state.owner)){verifiedSymbol=null;$("symbol-status").textContent="會話已變更，請重新查核商品。";}
- $("symbol-quote").textContent=marketText(state.market?.[symbol],symbol);
+ const entry=state?.owner?state.market?.[symbol]:null,q=entry?.quote;
+ $("symbol-quote").textContent=marketText(entry,symbol);
+ quoteProduct.textContent=`${symbol||"商品未選擇"}${entry?.name?` · ${entry.name}`:""} · 美股`;
+ quotePrice.textContent=q?number(q.price):"—";
+ quoteKind.textContent=q?(q.kind==="trade"?"最後成交價":q.kind==="snapshot"?"快照參考價":"參考價（非新成交）"):"尚未取得行情";
+ marketBox.classList.toggle("quote-muted",!q||["stale","disconnected","error"].includes(entry.status));
+ rangeSuggest.disabled=!usableReference();
+ if(!rangeSeeded&&!rangeTouched&&!editing)suggestRange(false);
+ renderRangeWarning();
+ renderEditorPreviewQuote();
 }
-fieldInput("symbol").addEventListener("input",()=>{invalidateSymbol();lookupTimer=setTimeout(()=>safe(lookupEditor,"symbol-status"),650);});
+function renderEditorPreviewQuote(){
+ if(!editorPreview)return;
+ const {host,params,result}=editorPreview;
+ if(!$("form-preview").contains(host)){editorPreview=null;return;}
+ const entry=state?.owner?state.market?.[params.symbol]:null,q=entry?.quote;
+ const quote=params.mode==="demo"&&editing?WorkspaceView.displayQuote(editing,state):q?{...q,status:entry.status,label:q.kind==="trade"?"最後成交價":q.kind==="snapshot"?"快照參考價":"參考價（非新成交）"}:null;
+ WorkspaceView.drawGrid(host,WorkspaceView.gridModel(params,result.anchor,result.inventory,result.price_gap),quote,editing?WorkspaceView.pendingOrders(editing,state):[]);
+}
+function usableReference(){
+ const symbol=fieldInput("symbol").value.trim().toUpperCase(),entry=state?.owner?state.market?.[symbol]:null,q=entry?.quote;
+ if(!q||!verifiedSymbol||verifiedSymbol.symbol!==symbol||verifiedSymbol.generation!==state.generation||["stale","disconnected","error"].includes(entry.status))return null;
+ const price=Number(q.price),times=[q.source_time,q.received_time].map(t=>Date.parse(t));
+ return Number.isFinite(price)&&price>=1&&times.every(t=>Number.isFinite(t)&&Date.now()-t<=15000&&Date.now()-t>=-2000)?q:null;
+}
+function suggestRange(explicit){
+ const q=usableReference();if(!q||editing&&!explicit||!explicit&&(rangeTouched||rangeSeeded))return;
+ const cents=Math.round(Number(q.price)*100),radius=Math.max(10,Math.ceil(cents*.1/10)*10),low=Math.max(100,cents-radius),high=cents+radius;
+ // Even cent bounds keep the midpoint valid; cent-valued spacing is selected exactly.
+ const lower=low%2?low+1:low,upper=high%2?high+1:high,span=upper-lower;
+ const counts=Array.from({length:Math.min(1000,span)},(_,i)=>i+1).filter(n=>span%n===0).sort((a,b)=>Math.abs(a-20)-Math.abs(b-20));
+ fieldInput("lower_price").value=(lower/100).toFixed(2);fieldInput("upper_price").value=(upper/100).toFixed(2);
+ $("grid-intervals").value=counts[0];$("auto-enabled").checked=true;$("midpoint-start").checked=true;layoutBasis="count";rangeSeeded=true;
+ $("range-seed-note").textContent=`已依 ${number(q.price)} USD 帶入附近區間，可自由修改；行情更新不會覆寫。`;
+ scheduleLayout();renderRangeWarning();
+}
+function renderRangeWarning(){
+ const symbol=fieldInput("symbol").value.trim().toUpperCase(),q=state?.owner?state.market?.[symbol]?.quote:null,low=Number(fieldInput("lower_price").value),high=Number(fieldInput("upper_price").value),warning=$("range-warning");
+ const outside=q&&(high>0&&high<Number(q.price)||low>Number(q.price));
+ warning.hidden=!outside||(wizard&&wizardStep===0);
+ warning.textContent=outside?`${high<Number(q.price)?"上界低於":"下界高於"}目前${q.kind==="trade"?"最後成交價":"行情參考價"} ${number(q.price)} USD。這只是提醒，仍可使用此區間繼續設定。`:"";
+}
+fieldInput("symbol").addEventListener("input",()=>{rangeSeeded=false;invalidateSymbol();lookupTimer=setTimeout(()=>safe(lookupEditor,"symbol-status"),650);});
 fieldInput("mode").addEventListener("change",()=>{invalidateSymbol();safe(lookupEditor,"symbol-status");});
 $("strategy-dialog").addEventListener("close",()=>{editorEpoch++;invalidateSymbol();});
 setInterval(()=>{if(editorConsumer&&$("strategy-dialog").open&&!closed)safe(()=>command("market_watch",{consumer:editorConsumer}));},30000);
 
-function openGridEditor(s=null){
- editing=s;editorEpoch++;invalidateSymbol();wizard=false;wizardStep=0;layoutResult=null;
+function openGridEditor(s=null,seed=null){
+ editing=s;editorEpoch++;invalidateSymbol();wizard=false;wizardStep=0;layoutResult=null;rangeTouched=false;rangeSeeded=false;editorBusy=false;editorPreview=null;
  $("strategy-form-title").textContent=s?"編輯網格":"新增網格";
- const values=s?{...defaultParams(),...s.params}:{...defaultParams(),name:"",symbol:"",mode:$("mode-filter").value==="all"?"":$("mode-filter").value};
+ const values=s?{...defaultParams(),...s.params,...seed?.params}:{...defaultParams(),name:"",symbol:"",mode:$("mode-filter").value==="all"?"":$("mode-filter").value,...seed?.params};
+ if(s)for(const key of ["mode","symbol","initial_inventory","initial_cost"])values[key]=s.params[key];
  resetAnchor.checked=false;
  for(const [key,value]of Object.entries(values)){const input=fieldInput(key);if(!input)continue;if(input.type==="checkbox")input.checked=!!value;else input.value=value??"";input.disabled=!!s&&["mode","symbol","initial_inventory","initial_cost"].includes(key);}
  clearTimeout(layoutTimer);layoutRevision++;layoutBasis="count";
  $("auto-enabled").checked=!s;$("grid-intervals").value="20";$("midpoint-start").checked=true;$("auto-result").textContent="";layoutSuggestions.replaceChildren();
- $("form-preview").replaceChildren();$("strategy-error").textContent="";renderEditorStep();$("strategy-dialog").showModal();
+ $("advanced-settings").open=!!s;$("opening-settings").open=!!s?.params.initial_inventory;
+ if(seed){
+  const layout=seed.layout||{};
+  $("auto-enabled").checked=layout.auto??false;$("grid-intervals").value=layout.intervals??"20";$("midpoint-start").checked=layout.midpoint??false;layoutBasis=layout.basis==="gap"?"gap":"count";
+  wizard=!!layout.wizard;wizardStep=Math.max(0,Math.min(4,Number(layout.step)||0));resetAnchor.checked=!!s&&!!layout.reset_anchor;
+  $("advanced-settings").open=layout.advanced??!$("auto-enabled").checked;$("opening-settings").open=layout.opening??Number(values.initial_inventory)>0;
+  rangeTouched=true;rangeSeeded=true;
+ }
+ $("range-seed-note").textContent="無行情時可手動設定，不影響離線演練。";
+ $("form-preview").replaceChildren();$("strategy-error").textContent="";renderEditorStep();if(!$("strategy-dialog").open)$("strategy-dialog").showModal();
+ if(typeof editorLibraryOpened==="function")editorLibraryOpened(seed);
+ renderEditorMarket();
  if(values.symbol)safe(lookupEditor,"symbol-status");else $("symbol-status").textContent="請輸入商品代號，登入選帳後將自動查核。";
- if(!s)scheduleLayout();
+ if(!s&&!seed)scheduleLayout();
 }
 function renderEditorStep(){
- $("editor-mode").textContent=wizard?"切換完整表單":"切換逐步精靈";
+ $("editor-mode").textContent=wizard?"切換基本表單":"切換逐步精靈";
  $("wizard-steps").hidden=!wizard;$("wizard-tip").hidden=!wizard;
  $("wizard-steps").replaceChildren(...editorSteps.map(([title],i)=>el("span",`${i+1} ${title}`,i===wizardStep?"current":"")));
- $("wizard-tip").textContent=["先選擇商品及執行模式。登入只用於查核與行情，不會自動下單。","先填上下界與格數，間距及中點自動計算；也可改間距反算格數、改起始價。格子數是價格間隔數。","庫存限制會縮減可買／可賣格子。期初股數是已有部位，不會自動買入。","核對參數與可能委託後儲存；策略保持暫停。上一步可返回修改。"][wizardStep];
+ $("wizard-tip").textContent=["選擇商品與模式。未登入也能先手動設定與預覽；離線展示完全不需券商連線。","決定買價下界與賣價上界。有可用行情時協助帶入附近區間；偏離最後成交價只提醒，不阻擋。","只需填格子數，間距與起始價自動計算。需要自訂時展開進階設定。","設定每筆股數與結算方式。已有持股可選填；持股與金額限制在進階選用風控。","核對參數與可能委託後儲存；策略保持暫停。上一步可返回修改。"][wizardStep];
  editorSteps.forEach(([,names],i)=>names.forEach(name=>{fieldInput(name).closest("label").hidden=wizard&&i!==wizardStep;}));
- marketBox.hidden=wizard&&wizardStep!==0;$("auto-grid").hidden=wizard&&wizardStep!==1;
- anchorEdit.hidden=!editing||(wizard&&wizardStep!==1);
+ marketBox.hidden=false;$("auto-grid").hidden=wizard&&wizardStep!==2;
+ anchorEdit.hidden=!editing||(wizard&&wizardStep!==2);
+ $("advanced-settings").hidden=wizard&&![2,3].includes(wizardStep);$("opening-settings").hidden=wizard&&wizardStep!==3;
+ $("auto-enabled").closest("label").hidden=wizard&&wizardStep!==2;$("midpoint-choice").hidden=wizard&&wizardStep!==2;
+ const extras=[fieldInput("max_inventory").value?"持股上限":"",fieldInput("min_inventory").value!=="0"?"最少保留":"",fieldInput("max_order_value").value?"單筆上限":"",fieldInput("daily_buy_limit").value?"每日買入上限":""].filter(Boolean);
+ $("advanced-summary").textContent=extras.length?` · 已設定${extras.join("、")}`:"";
  if(editing)anchorSummary.textContent=`目前基準 ${number(editing.anchor)}；目前持股 ${position(editing.id)?.quantity??0} 股。${resetAnchor.checked?"儲存時明確重設為起始價；成交與成本仍保留。":"本次編輯保留基準；改預算、結算或間距不會偷偷回到起始價。"}`;
  $("auto-options").hidden=!$("auto-enabled").checked;
  fieldInput("gap").readOnly=false;fieldInput("gap_unit").disabled=$("auto-enabled").checked;
- $("preview-section").hidden=wizard&&wizardStep!==3;
+ $("preview-section").hidden=wizard&&wizardStep!==4;
  $("wizard-back").hidden=!wizard;$("wizard-back").disabled=wizardStep===0||editorBusy;
- $("wizard-next").hidden=!wizard||wizardStep===3;
- $("preview").hidden=wizard&&wizardStep!==3;
- document.querySelector("#strategy-form button[type=submit]").hidden=wizard&&wizardStep!==3;
+ $("wizard-next").hidden=!wizard||wizardStep===4;
+ $("preview").hidden=wizard&&wizardStep!==4;
+ document.querySelector("#strategy-form button[type=submit]").hidden=wizard&&wizardStep!==4;
+ renderRangeWarning();
 }
 function validateFields(step=null){
  for(let i=0;i<editorSteps.length;i++)for(const name of editorSteps[i][1]){
   if(step!==null&&i!==step)continue;
   const input=fieldInput(name);if(!input.checkValidity()){
-   if(wizard){wizardStep=i;renderEditorStep();}input.reportValidity();throw Error("請先完成標示的欄位。");
+   if(wizard){wizardStep=i;renderEditorStep();}const details=input.closest("details");if(details)details.open=true;input.reportValidity();throw Error("請先完成標示的欄位。");
   }
  }
 }
@@ -154,51 +220,55 @@ async function applyLayout(draft=false){
   $("grid-intervals").value=result.intervals;
   $("auto-result").textContent=`${layoutBasis==="count"?"依格數算間距":"依間距反算格數"}：${result.intervals} 個間隔${result.levels?`／${result.levels} 個價位`:""}；間距 USD ${result.gap}；起始 ${result.start_price}。${result.valid?(result.anchor_aligned?"":"起始價未落在上下界格線，實際委託格線以起始價平移，可能不抵達界線。"):`目前組合不可儲存：${result.error}。`}`;
   for(const suggestion of result.suggestions)layoutSuggestions.append(button(`改用 ${suggestion.intervals} 格（間距 ${suggestion.gap}）`,()=>{layoutBasis="count";$("grid-intervals").value=suggestion.intervals;scheduleLayout();}));
-  if(!draft||!wizard||wizardStep===1)$("strategy-error").textContent=result.error;
+  if(!draft||!wizard||wizardStep===2)$("strategy-error").textContent=result.error;
   if(!result.valid){if(!draft)throw Error(result.error);return;}
   layoutResult=result;
  }catch(e){
-  if(epoch===editorEpoch&&revision===layoutRevision){if(!$("auto-result").textContent.includes("目前組合不可儲存"))$("auto-result").textContent="目前輸入尚無法計算；請核對上下界、格數與間距。";if(!draft||!wizard||wizardStep===1)$("strategy-error").textContent=e.message;}
+  if(epoch===editorEpoch&&revision===layoutRevision){if(!$("auto-result").textContent.includes("目前組合不可儲存"))$("auto-result").textContent="目前輸入尚無法計算；請核對上下界、格數與間距。";if(!draft||!wizard||wizardStep===2)$("strategy-error").textContent=e.message;}
   if(!draft)throw e;
  }
 }
 async function requireProduct(){if(fieldInput("mode").value==="demo")return;if(!verifiedSymbol||verifiedSymbol.symbol!==fieldInput("symbol").value.trim().toUpperCase()||verifiedSymbol.generation!==state.generation){if(!await lookupEditor())throw Error("請先登入選帳，完成商品查核後繼續。");}}
 async function previewEditor(){
- await applyLayout();validateFields();await requireProduct();
+ await applyLayout();validateFields();
  const epoch=editorEpoch,params=readParams(),anchorReset=resetAnchor.checked,fingerprint=JSON.stringify([params,anchorReset]);
  const result=await command("preview",{params,...(editing?{strategy_id:editing.id,revision:editing.revision,reset_anchor:anchorReset}:{})});
  if(epoch!==editorEpoch||fingerprint!==JSON.stringify([readParams(),resetAnchor.checked]))return;
  const host=$("form-preview");host.replaceChildren(el("p",`${params.symbol} · ${modeNames[params.mode]} · 基準 ${number(result.anchor)} · 目前持股 ${result.inventory} · 固定價差 USD ${number(result.price_gap)} · 買 ${result.rows.filter(r=>r.side==="buy").length} 格／賣 ${result.rows.filter(r=>r.side==="sell").length} 格`,"summary-line"));
+ const totals=el("section",undefined,"preview-totals");totals.id="preview-totals";
+ totals.append(el("strong",`規劃買單合計 USD ${number(result.totals.buy_value)}`),el("span",`最多新增 ${result.totals.additional_shares} 股 · 每格價差 USD ${number(result.totals.price_gap)} · 買 ${result.totals.buy_levels} 格／賣 ${result.totals.sell_levels} 格`),el("small",`分別試算價格一路下跌買入／一路上漲賣出；未含費用，並非一次掛單或券商可用資金。${result.totals.truncated?"合計涵蓋完整規劃，下表每側僅列前 500 筆。":""}`));host.append(totals);
  host.append(table(["方向","限價 USD","股數","規劃後庫存"],result.rows.map(r=>[r.side==="buy"?"買進":"賣出",number(r.price),r.quantity,r.inventory])));
  host.prepend(table(["確認項目","設定"],[
   ["策略／方向",`${params.name} · ${params.direction==="both"?"雙邊買賣":params.direction==="buy"?"單邊買":"單邊賣"}`],
-  ["價格範圍 USD",`${params.lower_price}–${params.upper_price}`],["每筆／最少／期初／最多股數",`${params.quantity} / ${params.min_inventory} / ${params.initial_inventory} / ${params.max_inventory}`],
-  ["期初總成本 USD",params.initial_cost??"未知"],["單筆／每日買入上限 USD",`${params.max_order_value} / ${params.daily_buy_limit}`],
+  ["價格範圍 USD",`${params.lower_price}–${params.upper_price}`],["每筆／最少／期初／最多股數",`${params.quantity} / ${params.min_inventory} / ${params.initial_inventory} / ${inventoryLimitLabel(params.max_inventory)}`],
+  ["期初總成本 USD",params.initial_cost??"未知"],["進階單筆／每日買入上限",`${limitLabel(params.max_order_value)} / ${limitLabel(params.daily_buy_limit)}`],
   ["停止日期（台灣）／結算",`${params.end_date} / ${params.currency}`],["行情有效秒數",params.quote_max_age],
   ["行情低於下界",params.pause_buys_below_lower?"不新增買單，持續監控；已送單不撤銷":"只限制委託限價，可接受較低成交價"],
   ["編輯基準政策",editing?(resetAnchor.checked?"明確重設為起始價":"保留目前基準"):"以起始價建立"]
  ]));
+ const chart=el("figure",undefined,"editor-grid-visual");host.prepend(chart);host.prepend(totals);editorPreview={host:chart,params,result};renderEditorPreviewQuote();
  if($("auto-enabled").checked&&layoutResult&&!layoutResult.anchor_aligned)host.append(el("p","起始價未落在上下界格線，實際委託格線以起始價平移，可能不抵達上下界。","notice"));
  if(!result.rows.length)host.append(el("p","目前方向、部位與界線沒有可規劃的委託；請回上一步檢查。","notice"));
- host.append(el("p","每側最多顯示 500 筆規劃。單筆／每日金額與交易條件另在執行時檢查。","help"));
+ host.append(el("p",`每側最多顯示 500 筆規劃。${!state?.owner&&params.mode!=="demo"?"目前為未登入參數預覽；儲存此模式仍需登入選帳與商品查核。":"儲存不會啟動或下單。"}已選用的額外限制在執行時檢查。`,"help"));
  if($("auto-enabled").checked&&layoutResult){const d=el("details"),summary=el("summary",`上下界完整參考格線（${layoutResult.levels} 個價位，不代表委託）`);d.append(summary,el("p",layoutResult.prices.map(p=>number(p)).join(" · "),"grid-prices"));host.append(d);}
  $("strategy-error").textContent="";
+ $("preview-section").scrollIntoView({block:"start"});
 }
 async function saveEditor(){
  if(editorBusy)return;
- if(wizard&&wizardStep<3){$("wizard-next").click();return;}
+ if(wizard&&wizardStep<4){$("wizard-next").click();return;}
  editorBusy=true;const b=document.querySelector("#strategy-form button[type=submit]");b.disabled=true;
- await safe(async()=>{await applyLayout();validateFields();await requireProduct();const payload={params:readParams()};if(editing)Object.assign(payload,{strategy_id:editing.id,revision:editing.revision,reset_anchor:resetAnchor.checked});const result=await command(editing?"edit":"create",payload);selected=result.id;$("mode-filter").value=payload.params.mode;$("strategy-dialog").close();await refresh();toast("策略已儲存，尚未啟動");},"strategy-error");
+ await safe(async()=>{await applyLayout();validateFields();await requireProduct();const payload={params:readParams()};if(editing)Object.assign(payload,{strategy_id:editing.id,revision:editing.revision,reset_anchor:resetAnchor.checked});const result=await command(editing?"edit":"create",payload);if(typeof finishEditorDraft==="function")await finishEditorDraft();selected=result.id;$("mode-filter").value=payload.params.mode;$("strategy-dialog").close();await refresh();toast("策略已儲存，尚未啟動");},"strategy-error");
  b.disabled=false;editorBusy=false;
 }
 $("editor-mode").addEventListener("click",()=>{wizard=!wizard;wizardStep=0;renderEditorStep();});
 $("wizard-back").addEventListener("click",()=>{if(wizardStep>0)wizardStep--;$("strategy-error").textContent="";renderEditorStep();});
 $("wizard-next").addEventListener("click",()=>safe(async()=>{
  if(editorBusy)return;editorBusy=true;$("wizard-next").disabled=true;
- try{if(wizardStep===1)await applyLayout();validateFields(wizardStep);if(wizardStep===0)await requireProduct();if(wizardStep===2)await previewEditor();wizardStep=Math.min(3,wizardStep+1);$("strategy-error").textContent="";renderEditorStep();}finally{editorBusy=false;$("wizard-next").disabled=false;renderEditorStep();}
+ try{if(wizardStep===2)await applyLayout();validateFields(wizardStep);if(wizardStep===1&&Number(fieldInput("upper_price").value)<=Number(fieldInput("lower_price").value))throw Error("上界必須大於下界");if(wizardStep===3)await previewEditor();wizardStep=Math.min(4,wizardStep+1);$("strategy-error").textContent="";renderEditorStep();$("editor-scroll").scrollTop=0;}finally{editorBusy=false;$("wizard-next").disabled=false;renderEditorStep();}
 },"strategy-error"));
 for(const id of ["auto-enabled","midpoint-start"])$(id).addEventListener("change",()=>{if(id==="auto-enabled")layoutBasis="count";renderEditorStep();scheduleLayout();});
 $("grid-intervals").addEventListener("input",()=>{layoutBasis="count";scheduleLayout();});
-for(const name of ["lower_price","upper_price","start_price","gap"])fieldInput(name).addEventListener("input",()=>{if(name==="start_price")$("midpoint-start").checked=false;if(name==="gap")layoutBasis="gap";scheduleLayout();});
+for(const name of ["lower_price","upper_price","start_price","gap"])fieldInput(name).addEventListener("input",()=>{rangeTouched=true;if(name==="start_price")$("midpoint-start").checked=false;if(name==="gap")layoutBasis="gap";scheduleLayout();renderRangeWarning();});
 $("strategy-form").addEventListener("input",()=>{$("form-preview").replaceChildren(el("p","參數已變更，請重新預覽。","help"));});
 resetAnchor.addEventListener("change",renderEditorStep);

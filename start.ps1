@@ -2,6 +2,7 @@
     [int]$Port = 8765,
     [string]$Runtime = '',
     [switch]$NoBrowser,
+    [switch]$Browser,
     [string]$UvPath = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -22,20 +23,26 @@ try {
         throw 'Startup cancelled'
     }
     if ($existing) {
-        Open-ExistingGridWorkbench $existing -Runtime $Runtime -NoBrowser:$NoBrowser
+        Open-ExistingGridWorkbench $existing -Runtime $Runtime -NoBrowser:$NoBrowser -Browser:$Browser
         exit 0
     }
     $pythonWindowless = Initialize-GridEnvironment -Runtime $Runtime -NoUI:$NoBrowser -UvPath $UvPath -KeepProgress
     $script:SetupStage = 'launch_windowless'
     $entryScript = Join-Path $PSScriptRoot 'launch.pyw'
     if (-not (Test-Path -LiteralPath $pythonWindowless)) { throw 'Windowless Python missing' }
-    # The visible launcher owns readiness, browser opening and startup errors.
-    $launchArguments = @('-X', 'utf8', $entryScript, '--port', [string]$Port, '--no-browser')
+    # The desktop host owns its native window; this launcher opens the optional browser.
+    $launchArguments = @('-X', 'utf8', $entryScript, '--port', [string]$Port, '--launcher')
+    if ($NoBrowser) { $launchArguments += '--no-browser' }
+    if ($Browser) { $launchArguments += '--browser' }
     if ($Runtime) { $launchArguments += @('--runtime', $Runtime) }
     $quoted = ($launchArguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
     $backend = Start-Process -FilePath $pythonWindowless -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
     if (-not $NoBrowser) {
         $ready = Wait-GridWorkbench -Port $Port -Runtime $Runtime -Backend $backend
+        if ($ready.presentation_mode -eq 'desktop') {
+            Set-SetupProgress '桌面工作台已就緒。'
+            Write-SetupEvent $script:SetupLog 'workbench_desktop_opened' @{ port = $Port; backend_pid = $ready.backend_pid }
+        } else {
         $script:SetupStage = 'open_browser'
         Set-SetupProgress '工作台已就緒；正在開啟瀏覽器。'
         try { Start-Process -FilePath $ready.url }
@@ -45,6 +52,7 @@ try {
             throw
         }
         Write-SetupEvent $script:SetupLog 'workbench_browser_opened' @{ port = $Port; backend_pid = $ready.backend_pid }
+        }
     }
 } catch {
     if ($script:SetupStage -in @('environment_lock', 'runtime_lock')) {
@@ -52,7 +60,7 @@ try {
         $existing = Find-ExistingGridWorkbench -Port $Port -Runtime $Runtime
         if ($existing) {
             try {
-                Open-ExistingGridWorkbench $existing -Runtime $Runtime -NoBrowser:$NoBrowser
+                Open-ExistingGridWorkbench $existing -Runtime $Runtime -NoBrowser:$NoBrowser -Browser:$Browser
                 exit 0
             } catch { }
         } elseif ($script:SetupStage -eq 'environment_lock') {

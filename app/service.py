@@ -15,6 +15,10 @@ from .brokers.paper import PaperBroker
 from .brokers.superpy import SuperPyBroker
 from .brokers.order_diagnostics import report_matches
 from .calendar import MarketCalendar
+from .editor_library import EditorLibrary, reusable_params
+from .strategy_transfer import export_parameters, import_parameters
+from .inventory_handoff import InventoryHandoff
+from .simulation_exit import SimulationExit
 from .models import (
     ET,
     TW,
@@ -25,6 +29,7 @@ from .models import (
     decimal,
     grid_action,
     plan_rows,
+    plan_totals,
     utcnow,
 )
 from .market import MarketWatch
@@ -38,6 +43,7 @@ class Core:
         self.audit = audit or Audit(path.parent / "logs")
         self.audit.emit("startup_step", phase="database")
         self.store = Store(path)
+        self.editor_library = EditorLibrary(self.store)
         self.store.audit = self.audit
         self.store.recover()
         self.broker = broker or SuperPyBroker(audit=self.audit)
@@ -67,6 +73,8 @@ class Core:
         self.closing = False
         self.match_observations = {}
         self.recovery = Recovery(self)
+        self.inventory_handoff = InventoryHandoff(self)
+        self.simulation_exit = SimulationExit(self)
         self.audit.emit("startup_step", phase="restore_books")
         # History is append-only. Restore just the last matching book per owner;
         # unrelated snapshot kinds must not replace a saved matching book.
@@ -165,6 +173,7 @@ class Core:
                 raise ValueError("新價格界線不涵蓋目前網格基準；請調整界線或明確重設基準")
         return {
             "rows": plan_rows(p, anchor, inventory),
+            "totals": plan_totals(p, anchor, inventory),
             "price_gap": str(p.price_gap),
             "anchor": str(anchor),
             "inventory": inventory,
@@ -172,6 +181,59 @@ class Core:
 
     def cmd_grid_layout(self, draft=False, **values):
         return GridLayout.model_validate(values).calculate(draft=draft)
+
+    def cmd_history(self, strategy_id, kind, before=None, limit=50):
+        self.params(strategy_id)
+        return self.store.history(strategy_id, kind, before, limit)
+
+    def cmd_library(self, operation="list", **values):
+        if operation == "list":
+            return {"entries": self.editor_library.entries()}
+        if operation == "get":
+            return self.editor_library.get(**values)
+        if operation == "save":
+            return self.editor_library.save(**values)
+        if operation == "delete":
+            return self.editor_library.delete(**values)
+        raise ValueError("不支援的草稿／模板操作")
+
+    def cmd_copy_params(self, strategy_id, revision):
+        row, params = self.params(strategy_id)
+        if row["revision"] != revision:
+            raise ValueError("原策略已變更，請重新複製")
+        values = reusable_params(params.model_dump(mode="json"))
+        values["name"] = (values["name"][:35] + " 副本")[:40]
+        return {"params": values}
+
+    def cmd_strategy_export(self, selections):
+        return export_parameters(self, selections)
+
+    def cmd_inventory_handoff(self, source_id, target_id, replace_duplicate=False, confirm=False, version=None, operation_id=None):
+        return self.inventory_handoff.command(source_id, target_id, replace_duplicate, confirm, version, operation_id)
+
+    def cmd_inventory_handoff_status(self, operation_id):
+        receipt = self.inventory_handoff.completed(operation_id)
+        return {"found": receipt is not None, "receipt": receipt}
+
+    def cmd_simulation_exit(self, strategy_id, confirm=False, version=None, operation_id=None):
+        return self.simulation_exit.command(strategy_id, confirm, version, operation_id)
+
+    def cmd_simulation_exit_status(self, operation_id):
+        receipt = self.inventory_handoff.completed(operation_id, "simulation_exit")
+        return {"found": receipt is not None, "receipt": receipt}
+
+    def cmd_strategy_import(self, document, apply=False, selected=None, preview_token=None):
+        return import_parameters(self, document, apply, selected, preview_token)
+
+    def cmd_presentation_mode(self, mode):
+        if mode not in {"desktop", "browser"}:
+            raise ValueError("不支援的啟動介面")
+        with self.store.transaction():
+            self.store.db.execute(
+                "INSERT INTO application_preferences VALUES(1,?) ON CONFLICT(id) "
+                "DO UPDATE SET presentation_mode=excluded.presentation_mode", (mode,),
+            )
+        return {"mode": mode, "applies_on_next_start": True}
 
     def cmd_create(self, params):
         p = StrategyInput.model_validate(params)
@@ -202,7 +264,7 @@ class Core:
             if getattr(previous, key) != getattr(p, key):
                 raise ValueError("商品、模式與期初帳不可覆寫；請另建策略")
         qty = self.store.position(strategy_id)["quantity"]
-        if not p.min_inventory <= qty <= p.max_inventory:
+        if qty < p.min_inventory or (p.max_inventory is not None and qty > p.max_inventory):
             raise ValueError("新界線不涵蓋目前部位")
         anchor = str(p.start_price) if reset_anchor else row["anchor"]
         if not p.lower_price <= decimal(anchor) <= p.upper_price:
@@ -251,6 +313,17 @@ class Core:
             self.store.event("archive", "已封存，歷史仍保留", strategy_id)
         return {"archived": True}
 
+    def cmd_unarchive(self, strategy_id, revision):
+        row, _ = self.params(strategy_id)
+        if row["status"] != "archived" or row["revision"] != revision:
+            raise ValueError("封存策略已變更，請重新整理後再還原")
+        if sum(s["status"] != "archived" for s in self.store.strategies()) >= 15:
+            raise ValueError("工作台最多保留15組未封存策略，請先封存其他策略")
+        with self.store.transaction():
+            self.store.db.execute("UPDATE strategies SET status='paused',revision=revision+1,reconciled=0,reason='已從封存還原，請核對後啟動' WHERE id=?", (strategy_id,))
+            self.store.event("unarchive", "已還原為暫停；未啟動策略或變更實單授權", strategy_id)
+        return {"restored": True}
+
     def cmd_start(self, strategy_id, revision, confirm_live=False):
         self.recovery.take_over([strategy_id], "start")
         return self.start_strategy(strategy_id, revision, confirm_live)
@@ -276,8 +349,6 @@ class Core:
         if p.mode == "live":
             if not confirm_live or not self.live_armed or self.broker.disconnected.is_set():
                 raise ValueError("請先在實單控制中明確啟用本次會話")
-            if self.account_limit is None:
-                raise ValueError("請設定帳戶每日買入上限")
         rid = uuid.uuid4().hex
         guard = self.recovery.start_guard(strategy_id) if automatic else nullcontext(True)
         with guard as allowed:
@@ -442,7 +513,7 @@ class Core:
         if not action:
             return
         side, price = action
-        if price * p.quantity > p.max_order_value:
+        if p.max_order_value is not None and price * p.quantity > p.max_order_value:
             self.fail(sid, "觸價金額超過單筆上限")
             return
         today = utcnow().astimezone(ET).date().isoformat()
@@ -450,7 +521,7 @@ class Core:
         spent = sum(
             (decimal(r["limit_buy_value"]) for r in report["rows"] if r["strategy_id"] == sid), decimal(0)
         )
-        if side == "buy" and spent + price * p.quantity > p.daily_buy_limit:
+        if side == "buy" and p.daily_buy_limit is not None and spent + price * p.quantity > p.daily_buy_limit:
             self.fail(sid, "超過策略每日買入上限")
             return
         broker_held, sell_reserved = None, None
@@ -458,7 +529,7 @@ class Core:
         if p.mode == "live":
             self.broker.contract(p.symbol)
             self.audit.require_writable()
-            if self.session_order_count >= self.session_order_limit:
+            if self.session_order_limit is not None and self.session_order_count >= self.session_order_limit:
                 self.fail(sid, "已達本次會話實單筆數上限")
                 return
             if side == "sell":
@@ -485,9 +556,10 @@ class Core:
                 ),
                 decimal(0),
             )
-            if side == "buy" and (
-                self.account_limit is None
-                or account_spent + reserved + price * p.quantity > self.account_limit
+            if (
+                side == "buy"
+                and self.account_limit is not None
+                and account_spent + reserved + price * p.quantity > self.account_limit
             ):
                 self.fail(sid, "超過帳戶每日買入預算")
                 return
@@ -542,10 +614,12 @@ class Core:
                 "budget_day": today,
                 "budget_day_timezone": "America/New_York",
                 "strategy_buy_spent": str(spent),
-                "strategy_daily_limit": str(p.daily_buy_limit),
+                "strategy_daily_limit": str(p.daily_buy_limit) if p.daily_buy_limit is not None else None,
                 "account_buy_spent": str(account_spent) if account_spent is not None else None,
                 "reserved_buys": str(reserved) if reserved is not None else None,
-                "account_daily_limit": str(self.account_limit) if p.mode == "live" else None,
+                "account_daily_limit": str(self.account_limit)
+                if p.mode == "live" and self.account_limit is not None
+                else None,
                 "session_orders_used": self.session_order_count if p.mode == "live" else None,
                 "session_orders_limit": self.session_order_limit if p.mode == "live" else None,
             },
@@ -990,23 +1064,29 @@ class Core:
         if not self.owner or confirm is not True:
             raise ValueError("請先選帳並明確確認實單")
         self.audit.require_writable()
-        budget = decimal(daily_buy_limit)
-        if budget <= 0 or type(max_orders) is not int or not 1 <= max_orders <= 100:
-            raise ValueError("請設定正數每日買入上限與1至100筆本次會話上限")
+        budget = None if daily_buy_limit in (None, "") else decimal(daily_buy_limit)
+        if budget is not None and budget <= 0:
+            raise ValueError("選用每日買入上限時，請填入正數")
+        if max_orders is not None and (type(max_orders) is not int or not 1 <= max_orders <= 100):
+            raise ValueError("選用送單筆數限制時，請填入1至100筆")
         if report_timezone not in (None, "Asia/Taipei", "America/New_York", "UTC"):
             raise ValueError("不支援的成交回報時區")
         self.store.set_live_preferences(
             self.owner,
-            {"daily_buy_limit": str(budget), "max_orders": max_orders, "report_timezone": report_timezone},
+            {
+                "daily_buy_limit": str(budget) if budget is not None else None,
+                "max_orders": max_orders,
+                "report_timezone": report_timezone,
+            },
         )
         self.account_limit = budget
-        self.session_order_limit = self.session_order_count + max_orders
+        self.session_order_limit = self.session_order_count + max_orders if max_orders is not None else None
         self.broker.report_timezone = report_timezone
         self.live_armed = True
         self.audit.emit(
             "live_armed",
             owner=self.owner,
-            budget=str(budget),
+            budget=str(budget) if budget is not None else None,
             max_additional_orders=max_orders,
             report_timezone=report_timezone,
         )
@@ -1195,7 +1275,7 @@ class Core:
     def cmd_report(self, day=None):
         if day:
             date.fromisoformat(day)
-        return self.store.report(day)
+        return {**self.store.report(day), "summary_version": self.store.report_summary()["version"]}
 
     def cmd_import_legacy(self, records, apply=False):
         if not isinstance(records, list) or len(records) > 15:
@@ -1372,14 +1452,25 @@ class Core:
 
     def snapshot(self):
         audit_status = self.audit.status()
+        strategies = self.store.strategies()
+        ages = {}
+        for s in strategies:
+            if s["mode"] != "demo":
+                symbol = s["params"]["symbol"]
+                ages[symbol] = min(ages.get(symbol, 60), s["params"]["quote_max_age"])
+        # Local calendar/session facts for read-only status explanations; no broker query.
+        connected = bool(self.owner and not self.broker.disconnected.is_set())
         return {
             "audit_seq": audit_status["seq"],
             "audit_error": audit_status["error"],
             "ui_preferences": self.store.preferences(),
+            "presentation_mode": next((r["presentation_mode"] for r in self.store.rows("SELECT presentation_mode FROM application_preferences WHERE id=1")), "desktop"),
             "live_preferences": self.store.live_preferences(self.owner),
             "updated_at": utcnow().isoformat(),
             "stage": self.stage,
             "generation": self.generation,
+            "broker_connected": connected,
+            "market_open": self.calendar.is_open(utcnow()) if connected else None,
             "owner": self.owner,
             "accounts": self.broker.accounts,
             "selected": self.broker.selected,
@@ -1393,26 +1484,17 @@ class Core:
             },
             "live_reason": "實單已啟用：僅已確認啟動的正式策略可送單"
             if self.live_armed
-            else "實單未啟用：先登入、選帳，再設定實單限制並明確確認",
-            "strategies": self.store.strategies(),
-            "orders": self.store.orders(),
-            "fills": sorted(self.store.fills(), key=lambda f: f["received_at"], reverse=True)[:200],
+            else "實單未啟用：先登入、選帳，再明確確認本次實單；額外限制可選填",
+            "strategies": strategies,
+            "orders": self.store.display_orders(),
+            "fills": self.store.recent_fills(),
+            "history_version": self.store.db.total_changes,
+            "drafts": [e for e in self.editor_library.entries() if e["kind"] == "draft"],
             "events": self.store.rows("SELECT * FROM events ORDER BY id DESC LIMIT 100"),
-            "report": self.store.report(),
+            "report": self.store.report_summary(),
             "quotes": deepcopy(self.quotes),
             "quote_warnings": deepcopy(self.quote_warnings),
-            "market": self.market.snapshot(
-                {
-                    symbol: min(
-                        s["params"]["quote_max_age"]
-                        for s in self.store.strategies()
-                        if s["params"]["symbol"] == symbol and s["mode"] != "demo"
-                    )
-                    for symbol in {
-                        s["params"]["symbol"] for s in self.store.strategies() if s["mode"] != "demo"
-                    }
-                }
-            ),
+            "market": self.market.snapshot(ages),
             "reconciliation": deepcopy(self.reconciliation),
             "recovery_status": self.recovery.snapshot(),
             "fault": self.fault,

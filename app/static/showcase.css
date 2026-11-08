@@ -1,0 +1,5 @@
+/* Annotations only: every application component comes from the real style.css. */
+#showcase-watermark{position:fixed;right:15px;bottom:22px;z-index:4;color:#ffe0a0;background:#302610ed;border:1px solid #a58a52;padding:5px 10px;font-size:11px;pointer-events:none}
+#showcase-cursor{position:fixed;z-index:2147483647;font-family:"Segoe UI",sans-serif;font-size:34px;line-height:1;color:white;text-shadow:1px 1px 2px #000,-1px -1px 1px #000;pointer-events:none;transition:left .35s,top .35s;filter:drop-shadow(0 1px 3px #000)}
+.showcase-focus{outline:3px solid #ffd777!important;outline-offset:3px;box-shadow:0 0 0 6px #ffd77733!important}
+@media(prefers-reduced-motion:reduce){#showcase-cursor{transition:none}}

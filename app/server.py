@@ -4,6 +4,7 @@ from datetime import date
 import hashlib
 from io import BytesIO
 import os
+import re
 from pathlib import Path
 import secrets
 from urllib.parse import urlsplit
@@ -17,7 +18,30 @@ from pydantic import BaseModel, ConfigDict, Field
 from .service import Service
 
 STATIC = Path(__file__).parent / "static"
+
+
+def showcase_document():
+    """Use the maintained workbench markup and modules, with fake IO installed first."""
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    page = re.sub(r'<script src="/static/showcase-player\.js" defer></script>', '', page)
+    page = page.replace('/static/', '/showcase/assets/')
+    page = page.replace('</head>', '<link rel="stylesheet" href="/showcase/assets/showcase.css">'
+                        '<script src="/showcase/assets/showcase.js" defer></script>'
+                        '<script src="/showcase/assets/showcase-adapter.js" defer></script></head>')
+    return page.replace('</body>', '<script src="/showcase/assets/showcase-ui.js" defer></script></body>')
+
+
+def showcase_assets():
+    return set(re.findall(r'/showcase/assets/([a-z0-9-]+\.(?:js|css))', showcase_document()))
 ACTIONS = {
+    "simulation_exit",
+    "simulation_exit_status",
+    "unarchive",
+    "inventory_handoff",
+    "inventory_handoff_status",
+    "strategy_export",
+    "strategy_import",
+    "history",
     "grid_layout",
     "market_watch",
     "preview",
@@ -48,6 +72,9 @@ ACTIONS = {
     "recovery_takeover",
     "bulk_stop",
     "ui_preferences",
+    "library",
+    "copy_params",
+    "presentation_mode",
 }
 
 
@@ -127,6 +154,9 @@ def create_app(path=None, service_factory=Service):
     app.state.service = service
     app.state.instance = instance
     app.state.shutdown_callback = None
+    app.state.activate_callback = None
+    app.state.presentation_mode = "browser"
+    app.state.desktop_ready = False
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next):
@@ -137,10 +167,19 @@ def create_app(path=None, service_factory=Service):
         except ValueError:
             valid = False
         origin = request.headers.get("origin")
+        # An opaque sandbox has a null origin. Only these credential-free, fixed
+        # presentation assets may load from it; API and workbench guards stay intact.
+        asset = request.url.path.removeprefix("/showcase/assets/")
+        showcase_resource = request.method in {"GET", "HEAD"} and (
+            request.url.path in {"/static/showcase.js", "/static/showcase.css"}
+            or (request.url.path.startswith("/showcase/assets/") and asset in showcase_assets())
+        )
         if (
             not valid
-            or (origin and origin != f"http://{host}")
-            or request.headers.get("sec-fetch-site") == "cross-site"
+            or (not showcase_resource and (
+                (origin and origin != f"http://{host}")
+                or request.headers.get("sec-fetch-site") == "cross-site"
+            ))
         ):
             return JSONResponse({"detail": "僅允許本機同來源操作"}, status_code=403)
         if request.method not in ("GET", "HEAD"):
@@ -156,15 +195,30 @@ def create_app(path=None, service_factory=Service):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         )
+        if request.url.path == "/static/showcase.html":
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; "
+                "connect-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+            )
         return response
 
     @app.get("/")
     def home():
         return FileResponse(STATIC / "index.html")
 
+    @app.get("/static/showcase.html")
+    def showcase():
+        return Response(showcase_document(), media_type="text/html")
+
+    @app.get("/showcase/assets/{name}")
+    def showcase_asset(name: str):
+        if name not in showcase_assets():
+            raise HTTPException(404, "未知展示資源")
+        return FileResponse(STATIC / name)
+
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.5"}
+        return {"token": token, "instance": instance, "version": "0.1.13"}
 
     @app.get("/api/health")
     def health():
@@ -173,15 +227,26 @@ def create_app(path=None, service_factory=Service):
             "product": "kgi-us-grid-web",
             "protocol": 1,
             "instance": instance,
-            "version": "0.1.5",
+            "version": "0.1.13",
             "pid": os.getpid(),
             "runtime_id": runtime_identity(directory),
             "ready": service.thread.is_alive() and not service.stop_event.is_set(),
+            "presentation_mode": app.state.presentation_mode,
+            "desktop_ready": app.state.desktop_ready,
         }
 
     @app.get("/api/state")
     def state():
         return service.get_state()
+
+    @app.post("/api/desktop/activate")
+    def activate_desktop():
+        if not app.state.activate_callback:
+            raise HTTPException(409, "目前不是桌面模式或視窗尚未就緒")
+        try:
+            return app.state.activate_callback()
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @app.get("/api/diagnostics")
     def diagnostics():

@@ -1,11 +1,12 @@
 [project]
 name = "kgi-us-grid-web"
-version = "0.1.5"
+version = "0.1.13"
 description = "Local US grid trading workbench with a persistent execution ledger"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pydantic>=2.9,<3",
   "tzdata>=2025.2", "exchange-calendars>=4.7,<5", "openpyxl>=3.1,<4",
+  "pywebview==6.2.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

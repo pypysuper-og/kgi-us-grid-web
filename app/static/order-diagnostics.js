@@ -60,12 +60,12 @@ async function openOrderEvidence(order){
     ["基準／固定價差／週期",`${d.strategy.anchor} / ${d.strategy.price_gap} / ${d.strategy.cycle}`],
     ["觸發行情／來源",`${d.quote.price} USD / ${d.quote.source}`],
     ["行情接收／來源時間",`${timeLabel(d.quote.received_time)} / ${d.quote.source_time?timeLabel(d.quote.source_time):`${d.quote.raw_source_time||"未提供"}（時區未知）`}`],
-    ["持股／最少／最多",`${d.position.quantity} / ${p.min_inventory} / ${p.max_inventory}`],
+    ["持股／最少／最多",`${d.position.quantity} / ${p.min_inventory} / ${inventoryLimitLabel(p.max_inventory)}`],
     ["價格界線／低於下界政策",`${p.lower_price}–${p.upper_price} / ${p.pause_buys_below_lower?"不新增買單":"只限制委託限價"}`],
-    ["委託金額／單筆上限 USD",`${d.order.value} / ${p.max_order_value}`],
-    ["每日買入已用／策略上限 USD",`${checks.strategy_buy_spent} / ${checks.strategy_daily_limit}`],
-    ["帳戶已用／保留量／上限 USD",d.order.mode==="live"?`${checks.account_buy_spent} / ${checks.reserved_buys} / ${checks.account_daily_limit}`:"不適用"],
-    ["本次送單前已用／會話上限",d.order.mode==="live"?`${checks.session_orders_used} / ${checks.session_orders_limit}`:"不適用"],
+    ["委託金額／單筆上限 USD",`${d.order.value} / ${limitLabel(p.max_order_value)}`],
+    ["每日買入已用／策略上限 USD",`${checks.strategy_buy_spent} / ${limitLabel(checks.strategy_daily_limit)}`],
+    ["帳戶已用／保留量／上限 USD",d.order.mode==="live"?`${checks.account_buy_spent} / ${checks.reserved_buys} / ${limitLabel(checks.account_daily_limit)}`:"不適用"],
+    ["本次送單前已用／會話上限",d.order.mode==="live"?`${checks.session_orders_used} / ${checks.session_orders_limit??"未另設限制"}`:"不適用"],
     ["預算日期／時區",`${checks.budget_day} / ${checks.budget_day_timezone}`],
     ["送單結算方式／檢查結果",`${settlementLabel(d.order.currency)} / 通過送單前檢查（不代表券商受理或成交）`]
    ]));

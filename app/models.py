@@ -34,13 +34,13 @@ class StrategyInput(BaseModel):
     quantity: int = Field(gt=0, le=1000000, strict=True)
     min_inventory: int = Field(default=0, ge=0, strict=True)
     initial_inventory: int = Field(default=0, ge=0, strict=True)
-    max_inventory: int = Field(gt=0, le=10000000, strict=True)
+    max_inventory: int | None = Field(default=None, gt=0, le=10000000, strict=True)
     initial_cost: Decimal | None = Field(default=None, ge=0)
     opening_confirmed: bool = False
     lower_price: Decimal = Field(gt=0)
     upper_price: Decimal = Field(gt=0)
-    max_order_value: Decimal = Field(gt=0)
-    daily_buy_limit: Decimal = Field(gt=0)
+    max_order_value: Decimal | None = Field(default=None, gt=0)
+    daily_buy_limit: Decimal | None = Field(default=None, gt=0)
     currency: Literal["MUT", "TWD"] = "MUT"
     end_date: date
     quote_max_age: int = Field(default=15, ge=1, le=60)
@@ -56,7 +56,7 @@ class StrategyInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_bounds(self):
-        if not self.min_inventory <= self.initial_inventory <= self.max_inventory:
+        if self.initial_inventory < self.min_inventory or (self.max_inventory is not None and self.initial_inventory > self.max_inventory):
             raise ValueError("庫存須符合 最少 ≤ 期初 ≤ 最多")
         if not self.lower_price <= self.start_price <= self.upper_price:
             raise ValueError("起始價須位於價格界線內")
@@ -109,7 +109,7 @@ def grid_action(params: StrategyInput, anchor: Decimal, inventory: int, price: D
         and price <= buy
         and (not params.pause_buys_below_lower or price >= params.lower_price)
         and params.lower_price <= buy <= params.upper_price
-        and inventory + params.quantity <= params.max_inventory
+        and (params.max_inventory is None or inventory + params.quantity <= params.max_inventory)
     ):
         return "buy", buy
     if (
@@ -126,13 +126,9 @@ def plan_rows(params: StrategyInput, anchor=None, inventory=None):
     anchor = params.start_price if anchor is None else anchor
     inventory = params.initial_inventory if inventory is None else inventory
     rows = []
-    for side, sign, cap in (
-        ("sell", 1, inventory - params.min_inventory),
-        ("buy", -1, params.max_inventory - inventory),
-    ):
-        if params.direction not in ("both", side):
-            continue
-        for level in range(1, min(cap // params.quantity, 500) + 1):
+    totals = plan_totals(params, anchor, inventory)
+    for side, sign in (("sell", 1), ("buy", -1)):
+        for level in range(1, min(totals[side + "_levels"], 500) + 1):
             price = anchor + sign * params.price_gap * level
             if not params.lower_price <= price <= params.upper_price:
                 break
@@ -145,6 +141,22 @@ def plan_rows(params: StrategyInput, anchor=None, inventory=None):
                 }
             )
     return rows
+
+
+def plan_totals(params, anchor, inventory):
+    """The same one-way grid paths as plan_rows, including its undisplayed tail."""
+    counts = {}
+    for side, distance, capacity in (
+        ("buy", anchor - params.lower_price, None if params.max_inventory is None else params.max_inventory - inventory),
+        ("sell", params.upper_price - anchor, inventory - params.min_inventory),
+    ):
+        levels = int(distance // params.price_gap)
+        counts[side] = max(0, levels if capacity is None else min(capacity // params.quantity, levels)) if params.direction in ("both", side) else 0
+    buys = counts["buy"]
+    return {"buy_value": str(params.quantity * (buys * anchor - params.price_gap * buys * (buys + 1) / 2)),
+            "additional_shares": buys * params.quantity, "price_gap": str(params.price_gap),
+            "buy_levels": buys, "sell_levels": counts["sell"],
+            "truncated": any(n > 500 for n in counts.values())}
 
 
 class GridLayout(BaseModel):

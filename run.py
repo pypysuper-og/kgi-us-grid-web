@@ -9,6 +9,7 @@ import webbrowser
 
 import uvicorn
 from app.server import create_app
+from app.desktop import DesktopHost, saved_presentation_mode, webview2_version
 
 
 class ServerFailure(RuntimeError):
@@ -66,8 +67,12 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--browser", action="store_true", help="Use the optional browser UI")
+    parser.add_argument("--launcher", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     app = create_app(args.runtime)
+    presentation = "browser" if args.browser or args.no_browser else saved_presentation_mode(app.state.service.path)
+    app.state.presentation_mode = presentation
     server = WorkbenchServer(
         uvicorn.Config(
             app,
@@ -84,12 +89,16 @@ def main():
     finished = threading.Event()
     stage = "listen"
     try:
+        if presentation == "desktop":
+            stage = "desktop_engine"
+            webview2_version()
+        stage = "listen"
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         sock.bind(("127.0.0.1", args.port))
         sock.listen(128)
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        print(f"KGI US Grid Web 0.1.4: {url}", flush=True)
+        print(f"US Grid Workbench: {url}", flush=True)
 
         def open_browser():
             deadline = time.monotonic() + app.state.service.startup_timeout + 15
@@ -103,11 +112,42 @@ def main():
                     return
                 finished.wait(0.1)
 
-        if not args.no_browser:
+        if presentation == "browser" and not args.no_browser and not args.launcher:
             threading.Thread(target=open_browser, daemon=True).start()
         app.state.service.audit.emit("server_starting", host="127.0.0.1", port=args.port)
         stage = "server_startup"
-        server.run(sockets=[sock])
+        if presentation == "desktop":
+            failure = []
+
+            def serve():
+                try:
+                    server.run(sockets=[sock])
+                except BaseException as exc:
+                    failure.append(exc)
+                finally:
+                    finished.set()
+
+            worker = threading.Thread(target=serve, name="grid-http-server")
+            worker.start()
+            try:
+                deadline = time.monotonic() + app.state.service.startup_timeout + 15
+                while not server.started and not finished.wait(.1):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("桌面入口等待後端就緒逾時")
+                if failure:
+                    raise failure[0]
+                if not server.started:
+                    raise RuntimeError("後端未完成啟動")
+                DesktopHost(app, finished).run(url)
+            finally:
+                server.should_exit = True
+                worker.join(15)
+            if worker.is_alive():
+                raise RuntimeError("後端尚未完成結束，請保留紀錄")
+            if failure:
+                raise failure[0]
+        else:
+            server.run(sockets=[sock])
         stage = "shutdown"
         if (
             not app.state.service.cleanup_complete.is_set()
@@ -118,6 +158,8 @@ def main():
     except BaseException as exc:
         service = app.state.service
         detail = dict(service.startup_failure or {"stage": stage, "reason": "server_error"})
+        if isinstance(exc, ValueError) and str(exc) in {"webview2_runtime_missing", "desktop_requires_windows"}:
+            detail["reason"] = str(exc)
         detail["error_type"] = type(exc).__name__ if "error_type" not in detail else detail["error_type"]
         if isinstance(exc, SystemExit) and isinstance(exc.code, int):
             detail["server_exit_code"] = exc.code
