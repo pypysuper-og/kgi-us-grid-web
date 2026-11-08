@@ -1,10 +1,10 @@
 {
   "name": "kgi-us-grid-web",
-  "version": "0.1.5",
-  "source_commit": "03c40de59133b116822b59edca8ff98b54d48fb9",
-  "source_modified": false,
-  "content_fingerprint": "adbdebc3ffb31533b1250ebfe62422cd25ed48d54bee5a293cfbfc57cea69cc5",
+  "version": "0.1.13",
   "type": "source",
+  "source_commit": "b92d9b627d31fa2367af0384d79daacb878007c8",
+  "source_modified": false,
+  "content_fingerprint": "bb1a98560a2c544cf256541a9b7c7198a0590add45706b1054f034a5203ed8ff",
   "sdk": "2.1.2",
   "python": "3.12-x64"
 }
