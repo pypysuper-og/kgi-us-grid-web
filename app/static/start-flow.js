@@ -39,7 +39,7 @@ async function continueStartFlow(){
  const pending=state.orders.filter(o=>o.strategy_id===s.id&&(!terminal.has(o.status)||o.unknown));
  if(pending.some(o=>o.unknown)){await reconcile(s,true);return;}
  if(!s.reconciled){await reconcile(s,true);return;}
- actionDialog(intent.retry_order_id?"確認拒單後重新送單":"啟動策略",`「${s.params.name}」 · ${modeNames[s.mode]} · ${s.params.symbol}\n後續新單結算：${settlementLabel(s.params.currency)}。${intent.retry_order_id?`原拒單結算：${settlementLabel(state.orders.find(o=>o.id===intent.retry_order_id)?.settlement_currency)}。`:""}\n${intent.retry_order_id?"原單必須已確認拒單且零成交；這會建立新單，並重新檢查行情、價格與額度。":"設定與對帳已就緒。"}每筆 ${s.params.quantity} 股，持股上限：${inventoryLimitLabel(s.params.max_inventory)}；策略每日買入：${limitLabel(s.params.daily_buy_limit)}。\n行情過期時警示並等待新行情，不需重新啟動。`,[
+ actionDialog(intent.retry_order_id?"確認拒單後重新送單":"啟動策略",`「${s.params.name}」 · ${modeNames[s.mode]} · ${s.params.symbol}\n後續新單結算：${settlementLabel(s.params.currency)}。${intent.retry_order_id?`原拒單結算：${settlementLabel(state.orders.find(o=>o.id===intent.retry_order_id)?.settlement_currency)}。`:""}\n${intent.retry_order_id?"原單必須已確認拒單且零成交；這會建立新單，並重新檢查行情、價格與額度。":"設定與對帳已就緒。"}每筆 ${s.params.quantity} 股，持股上限：${inventoryLimitLabel(s.params.max_inventory)}；策略每日買入：${limitLabel(s.params.daily_buy_limit)}。\n暫無新行情時會保持監控，收到有效新行情後再判斷，不需重新啟動。`,[
   {text:intent.retry_order_id?"確認建立新委託":"確認啟動",cls:"primary",fn:async()=>{if(intent.retry_order_id){await command("retry_order",{order_id:intent.retry_order_id,revision:s.revision,confirm:true});}else{await command("start",{strategy_id:s.id,revision:s.revision,confirm_live:s.mode==="live"});}cancelStartFlow();}},
   {text:"暫不啟動",fn:async()=>cancelStartFlow()},
  ]);

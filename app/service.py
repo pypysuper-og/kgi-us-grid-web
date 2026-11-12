@@ -255,6 +255,8 @@ class Core:
     def cmd_edit(self, strategy_id, params, revision, reset_anchor=False):
         self.recovery.take_over([strategy_id], "edit")
         row, previous = self.params(strategy_id)
+        if row["status"] == "archived":
+            raise ValueError("策略已封存，請先還原為暫停後再編輯")
         p = StrategyInput.model_validate(params)
         if type(reset_anchor) is not bool:
             raise ValueError("重設網格基準必須明確選擇")
@@ -389,6 +391,8 @@ class Core:
         if not isinstance(cancel, bool):
             raise ValueError("請明確選擇保留或撤銷未成交單")
         row, p = self.params(strategy_id)
+        if row["status"] == "archived":
+            raise ValueError("策略已封存，請先還原為暫停後再管理")
         if cancel and p.mode == "live" and row["owner"] != f"live:{self.owner}":
             raise ValueError("不可透過其他帳戶撤單；請登入原委託帳戶")
         self.recovery.take_over([strategy_id], "stop")
@@ -487,7 +491,7 @@ class Core:
             self.cmd_stop(sid, False)
             return
         if not quote.fresh(utcnow(), p.quote_max_age):
-            self.quote_warning(sid, "行情過期或等待來源更新；保持監控，新行情到達後自動恢復")
+            self.quote_warning(sid, "暫無新行情；保持監控，收到有效行情後繼續評估")
             return
         if p.pause_buys_below_lower and p.direction in ("both", "buy") and quote.price < p.lower_price:
             self.quote_warning(
@@ -566,7 +570,7 @@ class Core:
         decision_now = utcnow()
         # Contract/holding/report calls can block; their return does not keep an old quote fresh.
         if not quote.fresh(decision_now, p.quote_max_age):
-            self.quote_warning(sid, "送單前查核期間行情已過期；保持監控，等待下一筆有效行情")
+            self.quote_warning(sid, "送單前查核期間暫無新行情；保持監控，等待下一筆有效行情")
             return
         if p.mode != "demo":
             if self.broker.disconnected.is_set():
@@ -961,6 +965,8 @@ class Core:
 
     def reconcile_strategy(self, strategy_id, confirm=False, version=None):
         row, p = self.params(strategy_id)
+        if row["status"] == "archived":
+            raise ValueError("策略已封存，請先還原為暫停後再對帳")
         if p.mode != "demo" and row["owner"] != f"{p.mode}:{self.owner}":
             raise ValueError("請先選定策略所屬帳戶")
         self.sync_reports(row["owner"], p.mode)
@@ -1693,16 +1699,17 @@ class Service:
                     with self.lock:
                         self.state["fault"] = core.fault
         except BaseException as exc:
-            self.error = exc
+            self._publish_failure(exc)
             self.audit.emit("actor_failed", error_type=type(exc).__name__)
             self.ready.set()
         finally:
+            self._retire_commands(shutdown_result[0] if shutdown_result else None)
             cleanup_ok = False
             try:
                 if core:
                     core.close()
             except BaseException as exc:
-                self.error = exc
+                self._publish_failure(exc)
                 self.audit.emit("actor_cleanup_failed", error_type=type(exc).__name__)
             else:
                 # A factory that never returned a Core cannot attest to its partial resources.
@@ -1715,25 +1722,52 @@ class Service:
                         "status": "error",
                         "message": "登出後的帳本／背景清理尚未完成；請保留資料並查核，不要重送交易",
                     }
-                while True:
-                    try:
-                        queued_id, action, payload = self.commands.get_nowait()
-                    except queue.Empty:
-                        break
-                    payload.clear()
-                    with self.lock:
-                        self.results[queued_id] = {
-                            "id": queued_id,
-                            "status": "error",
-                            "message": "程式已停止接收操作；此排隊命令未執行",
-                        }
-                    self.audit.emit("command_canceled_by_shutdown", command_id=queued_id, action=action)
             self.audit.emit("actor_stopped", cleanup_complete=cleanup_ok)
             if cleanup_ok:
                 self.cleanup_complete.set()
             if shutdown_result:
                 with self.lock:
                     self.results[cid] = result
+
+    def _publish_failure(self, exc):
+        self.error = exc
+        with self.lock:
+            self.state["fault"] = "背景服務已停止；請保留資料並核對操作結果，不要重送交易"
+            self.state["stage"] = "背景服務已停止，等待人工查核"
+
+    def _retire_commands(self, shutdown_id=None):
+        # Every actor exit retires admitted work, including failures before a
+        # completed command could publish its snapshot. Never infer no effect
+        # for a command that had already started.
+        while True:
+            try:
+                queued_id, action, payload = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            payload.clear()
+            with self.lock:
+                self.results[queued_id] = {
+                    "id": queued_id,
+                    "status": "error",
+                    "outcome": "not_executed",
+                    "message": "程式已停止接收操作；此排隊命令未執行",
+                }
+            self.audit.emit(
+                "command_canceled_by_shutdown" if shutdown_id is not None else "command_canceled_by_actor_stop",
+                command_id=queued_id, action=action,
+            )
+        with self.lock:
+            interrupted = [pending_id for pending_id, row in self.results.items()
+                           if row["status"] == "running" and (shutdown_id is None or pending_id != shutdown_id)]
+            for pending_id in interrupted:
+                self.results[pending_id] = {
+                    "id": pending_id,
+                    "status": "error",
+                    "outcome": "unknown",
+                    "message": "背景服務中斷，操作結果未確認；請核對帳本與券商，不要重送交易",
+                }
+        for pending_id in interrupted:
+            self.audit.emit("command_outcome_unknown", command_id=pending_id)
 
     def close(self):
         self.stop_event.set()

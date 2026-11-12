@@ -127,6 +127,10 @@ class DesktopHost:
         webview2_version()
         import webview
 
+        if sys.platform == "win32":
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("USGrid.Workbench")
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         self.window = webview.create_window(
@@ -140,5 +144,6 @@ class DesktopHost:
         self.window.events.restored += lambda: self.on_visibility(False)
         self.app.state.activate_callback = self.activate
         threading.Thread(target=self.watch_backend, daemon=True).start()
-        webview.start(gui="edgechromium", private_mode=True, debug=False)
+        webview.start(gui="edgechromium", private_mode=True, debug=False,
+                      icon=str(Path(__file__).parent / "static/workbench.ico"))
 

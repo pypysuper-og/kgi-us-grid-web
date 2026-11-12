@@ -3,7 +3,7 @@
 (function(){
  let running=false,base=0,startedAt=0,frame=null,lastPaint=-1,index=0,ready=false,failed=false,focusNode=null;
  const trace=[],cursor=document.createElement("div");cursor.id="showcase-cursor";cursor.textContent="↖";cursor.setAttribute("aria-hidden","true");document.body.append(cursor);
- const notice=document.createElement("div");notice.id="showcase-watermark";notice.textContent="原介面操作展示・全部是假資料";document.body.append(notice);
+ const notice=document.createElement("div");notice.id="showcase-watermark";notice.textContent="原介面操作展示・使用模擬資料";document.body.append(notice);
  const find=selector=>typeof selector==="function"?selector():document.querySelector(selector);
  async function control(selector){for(let count=0;count<30;count++){const node=find(selector);if(node&&!node.disabled)return node;await new Promise(resolve=>setTimeout(resolve,50));}throw Error("原介面控制項尚未就緒："+String(selector));}
  function mark(node){
@@ -19,9 +19,9 @@
  const input=name=>`#strategy-form [name="${name}"]`;
  const steps=[
   [0,"開啟原登入視窗",()=>click("#login-open")],
-  [1,"輸入假帳號",()=>fill('#login-form [name="person_id"]',"DEMO")],
-  [2,"完成假帳號",()=>fill('#login-form [name="person_id"]',"DEMO-USER")],
-  [3,"填入假密碼",()=>fill('#login-form [name="password"]',"demo-password")],
+  [1,"輸入模擬帳號",()=>fill('#login-form [name="person_id"]',"DEMO")],
+  [2,"完成模擬帳號",()=>fill('#login-form [name="person_id"]',"DEMO-USER")],
+  [3,"填入模擬密碼",()=>fill('#login-form [name="password"]',"demo-password")],
   [4,"勾選登入確認",()=>check('#login-form [name="confirm_production"]')],
   [5,"按下登入",()=>submit("#login-form")],
   [7,"選擇展示帳戶",()=>click("#account-selector button")],

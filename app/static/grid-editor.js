@@ -12,7 +12,7 @@ let layoutBasis="count",layoutTimer=null,layoutRevision=0;
 let rangeTouched=false,rangeSeeded=false;
 let editorPreview=null;
 const fieldInput=name=>$("strategy-form").elements.namedItem(name);
-const marketStates={subscribing:"訂閱中",waiting:"等待本次訂閱首筆成交",receiving:"已接收參考資料・等待新成交",live:"有效成交",stale:"已過期・最後資料僅供參考",time_unverified:"來源時區未知",disconnected:"已斷線・等待重連",error:"行情查核／訂閱異常",unavailable:"訂閱不可用"};
+const marketStates={subscribing:"訂閱中",waiting:"等待本次訂閱首筆成交",receiving:"已接收參考資料・等待新成交",live:"有效成交",stale:"暫無新行情・最後資料僅供參考",time_unverified:"來源時區未知",disconnected:"已斷線・等待重連",error:"行情查核／訂閱異常",unavailable:"訂閱不可用"};
 function marketText(entry,symbol){
  if(!state?.owner)return "未登入選帳・無正式行情";
  if(!entry)return `${symbol} 等待商品查核／訂閱`;
@@ -22,7 +22,7 @@ function marketText(entry,symbol){
   const ages=state.strategies.filter(s=>s.mode!=="demo"&&s.params.symbol===symbol).map(s=>s.params.quote_max_age),limit=ages.length?Math.min(...ages):15;
   if([q.source_time,q.received_time].some(t=>!t||Date.now()-Date.parse(t)>limit*1000))status="stale";
  }
- if($("connection").textContent==="後端失聯")status="disconnected";
+ if(backendError)status="disconnected";
  const label=q?.kind==="trade"?"最後成交":q?.kind==="snapshot"?"快照參考價":"參考價（非新成交）";
  return `${q?`${label} ${number(q.price)} USD · `:""}${marketStates[status]||status}${q?` · ${q.source} · ${q.source_time?timeLabel(q.source_time)+"（本機時間）":q.raw_time+"（時區未知）"}`:""}`;
 }
@@ -47,7 +47,7 @@ HELP.parameters=["總體參數設定與 CLOV 案例",[
 HELP.market=["商品查核與動態行情",[
  "輸入商品後自動查核目前選定帳戶的美股合約清單，再取得快照及訂閱 USQuote Tick。未登入時先完成帳戶與連線；不會替你登入。離線展示可使用未驗證代號。",
  "合約清單確認的是券商列示的美股商品，不是當下保證受理或成交。休市、權限或暫停交易仍可能影響下單。沒有行情不能拿網格價或成本冒充。",
- "畫面區分來源快照、非新成交參考價、有效成交、過期與斷線。Tick 成交量為 0 不算新成交。Unix timestamp 或帶時區時間會自動辨識；來源缺時區時保留原時間與價格、標示時區未知，不要求手選。",
+ "畫面區分來源快照、非新成交參考價、有效成交、暫無新行情與斷線。「暫無新行情」會保留最後資料與來源時間，等待新行情後再判斷，不代表連線中斷。Tick 成交量為 0 不算新成交。Unix timestamp 或帶時區時間會自動辨識；來源缺時區時保留原時間與價格、標示時區未知，不要求手選。",
  "建立的非離線策略即使暫停仍持續顯示行情；相同商品共用訂閱，封存且無其他消費者才解除。關閉設定窗釋放編輯需求；登出／結束釋放行情。同帳戶重連自動查核後恢復原監控與剩餘實單額度，等待新有效行情；手動停止、登出及程式重啟不自動啟動。",
  "USQuote 訂閱目前用於展示；交易引擎仍使用 USData 快照及既有新鮮度與正常盤門檻。畫面顯示不是個人交易成交回報，不會改變部位。"
 ]];

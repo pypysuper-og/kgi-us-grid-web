@@ -9,23 +9,44 @@ async function openRecovery(ids=null,start=false,after=null){
  }
  const targets=ids===null?eligibleStrategies():state.strategies.filter(s=>ids.includes(s.id));
  if(!targets.length){toast("目前帳戶沒有可恢復的策略");return;}
- if(state.recovery_status!==undefined)await command("recovery_takeover",{strategy_ids:targets.map(s=>s.id)});
- if(start&&targets.some(s=>s.mode==="live"&&s.status!=="active")&&!state.live_available){
-  recoveryIntent={ids:targets.map(s=>s.id),start,after};openLiveSettings(null,targets);return;
- }
- recoveryContext={ids:targets.map(s=>s.id),start,after};
+ const context={ids:targets.map(s=>s.id),start,after,prepared:false};
+ recoveryContext=context;recoveryPlan=null;recoveryBusy=true;
  $("recovery-title").textContent=start?"查核、配對並恢復監控":"委託配對與對帳";
+ $("recovery-error").textContent="";$("recovery-ack").checked=false;$("recovery-confirm").disabled=true;
+ $("recovery-body").setAttribute("aria-busy","true");
+ $("recovery-body").replaceChildren(el("p",`正在準備 ${targets.length} 組策略的查核；完成後接續實單確認或委託與部位核對，無須重複啟動。`));
  if(!$("recovery-dialog").open)$("recovery-dialog").showModal();
+ try{
+  if(state.recovery_status!==undefined)await command("recovery_takeover",{strategy_ids:context.ids});
+  if(recoveryContext!==context||!$("recovery-dialog").open)return;
+  context.prepared=true;
+  if(start&&targets.some(s=>s.mode==="live"&&s.status!=="active")&&!state.live_available){
+   recoveryIntent={ids:context.ids,start,after};recoveryContext=null;$("recovery-dialog").close();
+   openLiveSettings(null,targets);return;
+  }
+ }catch(e){
+  if(recoveryContext===context&&$("recovery-dialog").open){
+   $("recovery-body").replaceChildren();
+   $("recovery-error").textContent=e.message+"；尚未套用配對或啟動新策略，可按重新查核。";
+  }
+  return;
+ }finally{recoveryBusy=false;$("recovery-body").setAttribute("aria-busy","false");}
+ if(recoveryContext!==context||!$("recovery-dialog").open)return;
  await loadRecovery();
 }
 async function loadRecovery(){
  if(recoveryBusy||!recoveryContext)return;
+ const context=recoveryContext;
+ if(!context.prepared)return openRecovery(context.ids,context.start,context.after);
  recoveryBusy=true;recoveryPlan=null;$("recovery-confirm").disabled=true;
+ $("recovery-body").setAttribute("aria-busy","true");
  $("recovery-error").textContent="";
  $("recovery-body").replaceChildren(el("p","正在讀取券商委託、成交與庫存，整理可配對項目…"));
  $("recovery-ack").checked=false;
  try{
-  recoveryPlan=await command("recovery_preview",{strategy_ids:recoveryContext.ids,report_timezone:$("recovery-timezone").value||null});
+  const plan=await command("recovery_preview",{strategy_ids:context.ids,report_timezone:$("recovery-timezone").value||null});
+  if(recoveryContext!==context||!$("recovery-dialog").open)return;
+  recoveryPlan=plan;
   const body=$("recovery-body");body.replaceChildren();
   for(const s of recoveryPlan.strategies){
    const card=el("section",undefined,"recovery-card");
@@ -44,9 +65,13 @@ async function loadRecovery(){
    body.append(card);
   }
   $("recovery-confirm").textContent=recoveryContext.start?"確認配對與庫存，恢復可啟動策略":"確認配對與庫存";
- }catch(e){$("recovery-body").replaceChildren();$("recovery-error").textContent=e.message+"；未更改配對或帳本，可稍後重新查核。";}
- finally{recoveryBusy=false;$("recovery-confirm").disabled=!recoveryPlan||!$("recovery-ack").checked;}
+ }catch(e){if(recoveryContext===context&&$("recovery-dialog").open){$("recovery-body").replaceChildren();$("recovery-error").textContent=e.message+"；未更改配對或帳本，可稍後重新查核。";}}
+ finally{recoveryBusy=false;$("recovery-body").setAttribute("aria-busy","false");$("recovery-confirm").disabled=!recoveryPlan||!$("recovery-ack").checked;}
 }
+$("recovery-dialog").addEventListener("close",()=>{
+ if($("recovery-dialog").open)return;
+ recoveryContext=null;recoveryPlan=null;$("recovery-ack").checked=false;$("recovery-confirm").disabled=true;
+});
 $("recovery-refresh").addEventListener("click",()=>safe(loadRecovery,"recovery-error"));
 $("recovery-timezone").addEventListener("change",()=>safe(loadRecovery,"recovery-error"));
 $("recovery-ack").addEventListener("change",()=>{$("recovery-confirm").disabled=recoveryBusy||!recoveryPlan||!$("recovery-ack").checked;});

@@ -44,7 +44,7 @@ const WorkspaceView = (() => {
   const p=s.params,position=(state.report?.rows||[]).find(r=>r.strategy_id===s.id),grid=gridModel(p,s.anchor,position?.quantity??p.initial_inventory);
   const pending=pendingOrders(s,state),engine=state.quotes?.[s.id];
   const result=(code,title,detail="",tone="neutral")=>({code,title,detail,tone,grid});
-  if(backendLost)return result("backend_lost","後端失聯，策略狀態待確認","最後顯示的狀態僅供參考，請確認工作台連線。","warning");
+  if(backendLost)return result("backend_lost","引擎無回應，策略狀態待確認","最後顯示的狀態僅供參考，請確認引擎狀態。","warning");
   if(s.status==="archived")return result("archived","策略已封存");
   if(state.fault||state.audit_error)return result("fault","交易服務需處理",state.fault||state.audit_error,"warning");
   if(pending.some(o=>o.unknown))return result("unknown_order","委託結果待查核","保留原單；確認券商結果前不建立新網格單。","warning");
@@ -71,7 +71,7 @@ const WorkspaceView = (() => {
   }
   const age=p.quote_max_age*1000,fresh=t=>{const delta=now-Date.parse(t);return Number.isFinite(delta)&&delta>=-2000&&delta<=age;};
   if(!engine||engine.symbol!==p.symbol||engine.generation!==state.generation)return result("quote_wait",s.mode==="demo"?"等待離線行情":"等待策略行情",s.mode==="demo"?`可用「離線行情」輸入 ${p.symbol} 價格，開始演練。`:"等待可用的策略行情；畫面參考價不代表已具備送單條件。","waiting");
-  if(!fresh(engine.received_time)||!(engine.source_time?fresh(engine.source_time):engine.source_updated))return result("quote_stale",s.mode==="demo"?"等待下一筆離線行情":"行情過期，等待有效更新",s.mode==="demo"?"離線演練收到新價格時才會評估；監控持續中。":"保留監控，收到有效行情後繼續評估。","waiting");
+  if(!fresh(engine.received_time)||!(engine.source_time?fresh(engine.source_time):engine.source_updated))return result("quote_stale",s.mode==="demo"?"等待下一筆離線行情":"暫無新行情",s.mode==="demo"?"離線演練收到新價格時才會評估；監控持續中。":"保持監控，等待符合時間條件的新行情後再判斷。","waiting");
   if(!s.reconciled)return result("reconcile","等待完成對帳","核對帳本後才能評估新單。","warning");
   if(state.quote_warnings?.[s.id])return result("quote_warning",state.quote_warnings[s.id],"監控持續中。","waiting");
   if(!grid)return result("parameters","網格參數需核對","目前無法建立價格圖。","warning");
@@ -82,7 +82,7 @@ const WorkspaceView = (() => {
   if(crossed)return result("triggered","已觸及網格價，等待引擎查核結果","尚不代表已送單或成交，仍需確認交易條件與券商結果。","waiting");
   const wording=allowed.map(([side,v])=>`${side==="buy"?"跌至":"漲至"} USD ${money(v.price)} ${side==="buy"?"買進":"賣出"} ${p.quantity} 股`).join("；");
   const blocked=Object.entries(grid.next).filter(([,v])=>!v.allowed).map(([side,v])=>`${side==="buy"?"買進":"賣出"}：${v.reason}`).join("；");
-  return result("price_wait",`等待價格：${wording}`,blocked||"每策略一次只建立一筆未結束網格單，全部成交後才移動基準。","ready");
+  return result("price_wait",`條件監控：${wording}`,blocked||"每策略一次只建立一筆未結束網格單，全部成交後才移動基準。","ready");
  }
  function setText(node,value) {const text=String(value??"");if(node.textContent!==text)node.textContent=text;}
  function summaryNode(compact=false) {

@@ -32,7 +32,7 @@ def showcase_document():
 
 
 def showcase_assets():
-    return set(re.findall(r'/showcase/assets/([a-z0-9-]+\.(?:js|css))', showcase_document()))
+    return set(re.findall(r'/showcase/assets/([a-z0-9-]+\.(?:js|css|svg|ico))', showcase_document()))
 ACTIONS = {
     "simulation_exit",
     "simulation_exit_status",
@@ -197,7 +197,7 @@ def create_app(path=None, service_factory=Service):
         )
         if request.url.path == "/static/showcase.html":
             response.headers["Content-Security-Policy"] = (
-                "default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; "
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
                 "connect-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
             )
         return response
@@ -218,7 +218,7 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.13"}
+        return {"token": token, "instance": instance, "version": "0.1.14"}
 
     @app.get("/api/health")
     def health():
@@ -227,10 +227,10 @@ def create_app(path=None, service_factory=Service):
             "product": "kgi-us-grid-web",
             "protocol": 1,
             "instance": instance,
-            "version": "0.1.13",
+            "version": "0.1.14",
             "pid": os.getpid(),
             "runtime_id": runtime_identity(directory),
-            "ready": service.thread.is_alive() and not service.stop_event.is_set(),
+            "ready": service.thread.is_alive() and not service.stop_event.is_set() and service.error is None,
             "presentation_mode": app.state.presentation_mode,
             "desktop_ready": app.state.desktop_ready,
         }

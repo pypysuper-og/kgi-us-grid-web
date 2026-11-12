@@ -16,7 +16,7 @@ button:focus-visible,[tabindex]:focus-visible,input:focus,select:focus { outline
 .close { padding:0 8px; border:0; color:#fff; background:transparent; font-size:calc(25px * var(--ui-scale,1)); }
 .top { flex:0 0 auto; min-height:48px; padding:7px 12px; background:#202020; border-bottom:1px solid #666; display:flex; justify-content:space-between; align-items:center; gap:12px; }
 .brand { display:flex; align-items:center; gap:9px; }
-.brandmark { background:var(--blue); color:var(--yellow); width:30px; height:30px; display:grid; place-items:center; font-size:calc(23px * var(--ui-scale,1)); font-weight:bold; }
+.brandmark { width:30px; height:30px; flex:none; display:block; object-fit:contain; }
 .brand strong { display:block; font-size:calc(17px * var(--ui-scale,1)); }
 .brand small,.eyebrow { display:none; }
 .session { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-size:calc(12px * var(--ui-scale,1)); }
@@ -140,7 +140,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.7 Consolas,monos
  .brand strong { font-size:calc(15px * var(--ui-scale,1)); }
  .session { gap:5px; }
  .session button { padding:5px 7px; font-size:calc(11px * var(--ui-scale,1)); }
- .brandmark { width:24px; height:24px; font-size:calc(19px * var(--ui-scale,1)); }
+ .brandmark { width:24px; height:24px; }
  .heading-actions { gap:4px; }
  .heading-actions button { font-size:calc(11px * var(--ui-scale,1)); padding:6px; }
  .notice { font-size:calc(11px * var(--ui-scale,1)); padding:5px 7px; }

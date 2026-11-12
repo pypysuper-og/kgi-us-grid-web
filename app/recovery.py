@@ -121,7 +121,10 @@ class Recovery:
         if action in {"recovery_takeover", "recovery_preview"}:
             ids = payload.get("strategy_ids")
             return ["*"] if ids is None else ids if isinstance(ids, list) else []
-        if action in {"start", "stop", "edit", "archive", "reconcile", "order_diagnostics", "opening_cost"}:
+        if action == "inventory_handoff":
+            return [payload[key] for key in ("source_id", "target_id")
+                    if isinstance(payload.get(key), str) and payload[key]]
+        if action in {"start", "stop", "edit", "archive", "reconcile", "order_diagnostics", "opening_cost", "simulation_exit"}:
             return [payload["strategy_id"]] if payload.get("strategy_id") else []
         if action in {"retry_order", "fee"}:
             return [o["strategy_id"] for o in orders if o["id"] == payload.get("order_id")]
