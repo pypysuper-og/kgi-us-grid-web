@@ -52,7 +52,7 @@
 
 ## 三步開始
 
-1. [下載可直接啟動的程式包（ZIP，v0.1.13）](https://github.com/pypysuper-og/kgi-us-grid-web/releases/download/v0.1.13/US-Grid-Workbench-0.1.13-b92d9b62-bb1a9856.zip)，解壓到可寫入的本機資料夾。
+1. [下載範例程式](https://github.com/pypysuper-og/kgi-us-grid-web/releases/download/v0.1.13/US-Grid-Workbench-0.1.13-b92d9b62-bb1a9856.zip)，解壓到可寫入的本機資料夾。
 2. 雙擊 **`start.vbs`**。缺少環境時自動準備 uv、Python 3.12 x64 與鎖定套件；完整時直接啟動。
 3. 桌面工作台開啟後，按「新增網格」選 **離線展示**，預覽、儲存並啟動策略，再用「離線行情」演練。
 
