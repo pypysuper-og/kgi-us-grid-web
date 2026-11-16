@@ -35,9 +35,10 @@ function renderAttention(){
  const fingerprint=JSON.stringify(items);if(fingerprint===attentionFingerprint)return;attentionFingerprint=fingerprint;attentionBody.replaceChildren();
  if(!items.length)attentionBody.append(el("p","目前沒有需要人工處理的項目。正常等待行情、休市及手動暫停會留在各策略狀態中。","help"));
  for(const item of items){const row=el("section",undefined,"attention-entry"),copy=el("div");copy.append(el("strong",item.title),el("p",item.reason));
-  const label={connection:"帳戶與連線",live:"實單設定",edit:"核對策略設定",reconcile:"核對庫存與委託"}[item.action];
+  const label={connection:"帳戶與連線",live:"實單設定",edit:"核對策略設定",reconcile:"核對庫存與委託",system:"查看系統異常"}[item.action];
   row.append(copy,button(label,()=>safe(async()=>{
    attentionDialog.close();const s=state.strategies.find(s=>s.id===item.id);
+   if(item.action==="system"){showHelp("system");return;}
    if(item.action==="connection"||item.action==="reconcile"&&s?.mode!=="demo"&&(!state.owner||s.owner!==`${s.mode}:${state.owner}`)){$("login-open").click();return;}
    if(item.action==="live"){$("live-open").click();return;}
    if(item.action==="edit"){await openStrategy(s);return;}

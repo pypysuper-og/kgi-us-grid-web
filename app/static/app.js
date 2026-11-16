@@ -87,7 +87,7 @@ function renderStrategies(){
  const tbody=wrap.querySelector("tbody"),existingRows=new Map([...tbody.children].map(row=>[row.dataset.strategyId,row]));
  let cursor=tbody.firstElementChild;
  for(const s of visible){
-  const p=position(s.id),ownOrders=state.orders.filter(o=>o.strategy_id===s.id),fingerprint=JSON.stringify([s,p?.quantity,ownOrders]);
+  const p=position(s.id),ownOrders=state.orders.filter(o=>o.strategy_id===s.id),system=WorkspaceView.systemStatus(s,state),fingerprint=JSON.stringify([s,p?.quantity,ownOrders,system?.state]);
   let row=existingRows.get(s.id);
   if(!row||row._strategyFingerprint!==fingerprint){
    const previous=row;row=el("tr",undefined,"strategy-card");row.dataset.strategyId=s.id;row._strategyFingerprint=fingerprint;
@@ -101,6 +101,10 @@ function renderStrategies(){
    if(s.status==="archived"){
     actions.append(button("查看歷史",()=>{selected=s.id;render();document.querySelector('[data-tab="events"]').click();}),button("還原為暫停",()=>actionDialog("還原封存策略",`${s.params.name} 將回到策略清單並保持暫停。停止日期與歷史保留，請核對設定後再啟動。`,[{text:"確認還原",fn:()=>command("unarchive",{strategy_id:s.id,revision:s.revision})}])));
    }else{
+    if(system){
+     actions.append(button("異常說明",()=>showHelp("system")));
+     if(["retry_wait","checking","connection_wait"].includes(system.state))actions.append(button("停止自動恢復",()=>safe(()=>command("recovery_takeover",{strategy_ids:[s.id]}))));
+    }
     actions.append(button("對帳",()=>safe(()=>reconcile(s))),button("編輯",()=>openStrategy(s)));
     if((p?.quantity??0)>0)actions.append(button("交接部位",()=>openInventoryHandoff(s)));
     actions.append(button("封存",()=>s.mode!=="live"&&(p?.quantity??0)>0?openSimulationExit(s):actionDialog("封存策略","僅無部位、無在途委託且已停止的策略可封存。正式持股可先交接給其他策略；歷史仍保留。",[{text:"確認封存",fn:()=>command("archive",{strategy_id:s.id})}])));
@@ -111,7 +115,7 @@ function renderStrategies(){
     const latest=state.orders.filter(o=>o.strategy_id===s.id).at(-1);
     if(canRetry(s,latest))actions.append(button("重新送單",()=>beginRetryFlow(s,latest),"danger"));
    }
-   const cells=[badge(stateNames[s.status],s.status==="active"?"":"neutral"),s.status==="archived"?"—":button(s.status==="active"?"停止":"啟動",()=>s.status==="active"?stopStrategy(s):startStrategy(s),s.status==="active"?"secondary":"primary"),name,marketCell(s),number(s.params.start_price),`${p?.quantity??0} 股`,s.params.end_date,actions];
+   const cells=[badge(system?"系統異常":stateNames[s.status],system?"bad":s.status==="active"?"":"neutral"),s.status==="archived"?"—":button(s.status==="active"?"停止":"啟動",()=>s.status==="active"?stopStrategy(s):startStrategy(s),s.status==="active"?"secondary":"primary"),name,marketCell(s),number(s.params.start_price),`${p?.quantity??0} 股`,s.params.end_date,actions];
    for(const value of cells){const cell=el("td");if(value instanceof Node)cell.append(value);else cell.textContent=value;row.append(cell);}
    if(previous){if(cursor===previous)cursor=row;previous.replaceWith(row);}
   }
@@ -207,6 +211,7 @@ function renderEngineStatus(){
 function render(){if(typeof loadLayout==="function")loadLayout(state.ui_preferences);const live=state.strategies.filter(s=>s.status!=="archived");$("metric-active").textContent=live.filter(s=>s.status==="active").length;$("metric-orders").textContent=state.orders.filter(o=>!terminal.has(o.status)||o.unknown).length;$("metric-holdings").textContent=state.report.rows.reduce((v,r)=>v+r.quantity,0);renderWorkbenchUX();renderNotice();renderEngineStatus();$("freshness").textContent="最近更新 "+timeLabel(state.updated_at);const visible=visibleStrategies();if(!visible.some(s=>s.id===selected))selected=visible[0]?.id||null;renderStrategies();renderDetail();renderAccounts();renderEditorMarket();}
 async function refresh(){if(pollBusy||closed)return;pollBusy=true;try{state=await request("/api/state");backendError="";render();}catch(e){backendError=e.message;renderEngineStatus();renderNotice();if(state){renderStrategies();renderDetail();renderEditorMarket();}}finally{pollBusy=false;}}
 const HELP={
+ system:["系統異常與自動恢復",["「系統異常」表示程式處理發生錯誤，例如記憶體不足；它與庫存差異或券商拒單分開顯示。先看策略列的原因與下一次查核時間。","可恢復異常會暫停該策略，沿用原帳戶與剩餘額度查核委託及庫存，通過後恢復原監控，不重送既有委託。自動查核採指數退避：1、2、4、8秒起，最高每300秒一次，無重試次數上限；畫面顯示實際已開始的重試次數。","可按「停止自動恢復」接手；開啟對帳、查單、編輯或停止也會取消背景恢復。只看異常說明不會取消。人工接手只取消排程、保留次數；自動或手動恢復監控成功後停止重試並歸零，日誌保留故障識別、每次結果及恢復前累計次數。","未知委託仍須先查原單；先排除系統原因，再對帳及啟動。登出或重啟不延續自動恢復授權；舊紀錄未保存類型時顯示原因未記錄，不猜測拒單或記憶體不足。"]],
  orderLimit:["送單筆數限制",["這是進階選用的本程式實單額度；留空不啟用。所有正式策略共用，買單與賣單每次進入送單流程各計1筆。查詢、撤單、離線與行情模擬不計。","已嘗試送單即佔用額度；被拒、結果未明或之後撤銷也不退回。重新送出新委託另計1筆。買1筆再賣1筆，共2筆。","填20並啟用，表示從現在起最多再嘗試20筆；重新設定會將剩餘額度改為20，不是加在原本剩餘額度上。這不是每日自動重置的限制。","用完後，下一次觸發新單的策略會暫停，已送出的委託仍會追蹤，不會自動撤單或平倉。可調整或清空額度後重新確認並啟動暫停策略；設定不會自動啟動策略。","已選用的金額上限與持股限制分別生效。程式重啟後不沿用實單授權，需重新確認。"]],
  overview:["工作台怎麼用",["頂端「引擎已準備」表示工作台引擎可以回應；券商登入與帳戶連線另看右側標示。「引擎需檢查」請看錯誤提示；「引擎無回應」時目前操作結果仍須核對。","按「新增網格」自行選擇模式，可用逐步精靈完成參數與預覽，再另行啟動。所有策略都需要另按啟動，儲存不會執行交易。","桌面左側是策略與設定，右側用分頁查看規劃、委託、成交、成本與事件。窄畫面用「策略與設定／規劃與紀錄」切換。主畫面固定，長資料在區塊內捲動。","「更多功能 → 離線行情」開啟測試小視窗；上方「功能說明」可閱讀完整手冊，各區「？」可連到對應主題。關閉後回到原工作台。","關閉瀏覽器不會停止後端。離開前請停止策略，或用「結束程式」選擇未成交單的處理方式。"]],
  strategies:["策略監控與停止",["「條件監控」列出下一次買賣價位與股數，尚未觸發時持續監看，不代表已送出委託。從全部啟動進入登入後，選帳完成會接續顯示準備與查核進度，等待時不必重複啟動；關閉後不會在稍後自動接續或確認啟動。","點選策略列可查看該策略的設定與紀錄；切換分頁或查看說明不會啟停策略。","啟動後等待新行情。停止只禁止新單；每次停止時可選保留委託或撤銷本策略的未成交單，不會賣掉已成交持股。","部分成交後撤單會保留實際部位並暫停。先核對剩餘持股，再重新啟動；不自動補足原委託。","正式策略封存前需無部位、無在途單並停止；可先交接剩餘部位。模擬持股可確認結束模擬並封存；已封存策略由清單狀態篩選找回；停止、編輯或對帳前需先還原為暫停，舊視窗的操作不會改變封存狀態。"]],

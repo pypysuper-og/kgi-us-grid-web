@@ -328,7 +328,9 @@ class Core:
 
     def cmd_start(self, strategy_id, revision, confirm_live=False):
         self.recovery.take_over([strategy_id], "start")
-        return self.start_strategy(strategy_id, revision, confirm_live)
+        result = self.start_strategy(strategy_id, revision, confirm_live)
+        self.recovery.complete(strategy_id, restored_by="manual")
+        return result
 
     def start_strategy(
         self, strategy_id, revision, confirm_live=False, automatic=False, expected_generation=None
@@ -666,6 +668,8 @@ class Core:
                 self.paper(row["owner"]).quote(p.symbol, quote.price, fill_limit)
                 self.save_book(row["owner"])
             self.sync_reports(row["owner"], p.mode)
+        except MemoryError as exc:
+            self.recovery.system_error(row, exc, "order_result")
         except Exception:
             self.fail(sid, "送單結果未明，保留意圖與保留量，請對帳")
 
@@ -1157,9 +1161,15 @@ class Core:
                 state = self.recovery.states.setdefault(sid, {})
                 if self.store.strategy(sid)["status"] == "active":
                     state["attempt"] = 0
-                self.fail(sid, "券商斷線；重連後自動查核並恢復監控")
-                state.update(state="connection_wait", retry_at=None, message="等待券商重連後查核")
+                    state["origin"] = "connection"
+                reason = "券商斷線；重連後自動查核並恢復監控"
+                if state.get("origin") == "system":
+                    reason = state["cause"] + "；券商斷線，等待重連後查核"
+                self.fail(sid, reason)
+                state.update(state="connection_wait", retry_at=None, retry_delay_seconds=None,
+                             message="等待券商重連後查核")
                 self.recovery.retry_due.pop(sid, None)
+                self.recovery.log_retry(sid, "waiting_for_connection")
             self.reconnect_due = now + 1
             self.broker.status(
                 phase="reconnect_wait",
@@ -1410,13 +1420,22 @@ class Core:
         self.last_poll = time.monotonic()
         active = [s for s in self.store.strategies() if s["status"] == "active" and s["mode"] != "demo"]
         watch_symbols = {s["params"]["symbol"] for s in active}
-        watch_symbols.update(o["symbol"] for o in self.store.pending() if o["owner"] == f"paper:{self.owner}")
+        paper_symbols = {
+            s["params"]["symbol"] for s in active if s["owner"] == f"paper:{self.owner}"
+        }
+        paper_symbols.update(o["symbol"] for o in self.store.pending() if o["owner"] == f"paper:{self.owner}")
+        watch_symbols.update(paper_symbols)
         for mode in ("paper", "live"):
             if any(o["owner"] == f"{mode}:{self.owner}" for o in self.store.pending()):
                 self.sync_reports(f"{mode}:{self.owner}", mode)
         for symbol in watch_symbols:
             try:
                 quote = self.broker.quote(symbol, self.generation)
+            except MemoryError as exc:
+                for s in active:
+                    if s["params"]["symbol"] == symbol:
+                        self.recovery.system_error(s, exc, "quote_read")
+                continue
             except Exception:
                 for s in active:
                     if s["params"]["symbol"] == symbol:
@@ -1431,30 +1450,34 @@ class Core:
                     ),
                     default=15,
                 )
-                if self.calendar.is_open(utcnow()) and quote.fresh(utcnow(), max_age):
+                if symbol in paper_symbols and self.calendar.is_open(utcnow()) and quote.fresh(utcnow(), max_age):
                     book_owner = f"paper:{self.owner}"
                     self.paper(book_owner).quote(symbol, quote.price)
                     self.save_book(book_owner)
                     self.sync_reports(book_owner, "paper")
-                for s in active:
-                    if s["params"]["symbol"] == symbol:
-                        self.on_quote(s["id"], s["revision"], quote)
             except AuditUnavailable:
-                # No intent exists: keep the user's active monitoring and limits.
-                # A prepared/dispatched intent has custody and needs reconciliation.
                 for s in active:
-                    if s["params"]["symbol"] == symbol and self.store.pending(s["id"]):
+                    if s["params"]["symbol"] == symbol and s["mode"] == "paper" and self.store.pending(s["id"]):
                         self.fail(s["id"], "稽核寫入中斷且有未結委託意圖；請查核，不自動重送")
             except Exception as exc:
                 for s in active:
-                    if s["params"]["symbol"] == symbol:
-                        self.audit.emit(
-                            "strategy_tick_error",
-                            strategy_id=s["id"],
-                            phase="quote_evaluation",
-                            error_type=type(exc).__name__,
-                        )
-                        self.fail(s["id"], "交易處理失敗；請查核委託與帳本")
+                    if s["params"]["symbol"] == symbol and s["mode"] == "paper":
+                        self.recovery.system_error(s, exc, "paper_matching")
+            for s in active:
+                if s["params"]["symbol"] != symbol or self.store.strategy(s["id"])["status"] != "active":
+                    continue
+                try:
+                    self.on_quote(s["id"], s["revision"], quote)
+                except AuditUnavailable:
+                    # Keep monitoring when no intent exists; uncertain effects retain custody.
+                    if self.store.pending(s["id"]):
+                        self.fail(s["id"], "稽核寫入中斷且有未結委託意圖；請查核，不自動重送")
+                except Exception as exc:
+                    self.audit.emit(
+                        "strategy_tick_error", strategy_id=s["id"],
+                        phase="quote_evaluation", error_type=type(exc).__name__,
+                    )
+                    self.recovery.system_error(s, exc)
 
     def snapshot(self):
         audit_status = self.audit.status()

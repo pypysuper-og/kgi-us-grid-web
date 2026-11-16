@@ -106,6 +106,8 @@ def normalized(report, executions, timezone):
 
 
 class Recovery:
+    SYSTEM_PREFIX = "系統異常："
+
     def __init__(self, core):
         self.core = core
         self.plan = None
@@ -113,6 +115,55 @@ class Recovery:
         self.retry_due = {}
         self.start_guard = lambda sid: nullcontext(True)
         self.publish = lambda: None
+
+    @staticmethod
+    def system_delay(attempt):
+        # Bound the exponent as well as the delay, even after years of retries.
+        return min(300, 2 ** min(max(attempt, 0), 9))
+
+    def log_retry(self, sid, phase, **details):
+        state = self.states.get(sid, {})
+        if state.get("origin") != "system":
+            return
+        self.core.audit.emit(
+            "system_recovery", strategy_id=sid, episode_id=state.get("episode_id"),
+            source_run_id=state.get("source_run_id"), revision=state.get("revision"),
+            generation=self.core.generation, phase=phase, attempt=state.get("attempt", 0),
+            error_type=state.get("error_type"), evidence_id=state.get("evidence_id"),
+            retry_at=state.get("retry_at"), next_delay_seconds=state.get("retry_delay_seconds"),
+            message=state.get("message"), **details,
+        )
+
+    def schedule_retry(self, sid, now):
+        state = self.states[sid]
+        delay = (
+            self.system_delay(state["attempt"]) if state.get("origin") == "system"
+            else min(300, 60 * 2 ** min(state["attempt"] - 1, 3))
+        )
+        self.retry_due[sid] = now + delay
+        state.update(
+            state="retry_wait", retry_delay_seconds=delay,
+            retry_at=(utcnow() + timedelta(seconds=delay)).isoformat(),
+        )
+        self.log_retry(sid, "scheduled", next_attempt=state["attempt"] + 1)
+
+    def complete(self, sid, restored_by):
+        """Reset only after a successful start; audit keeps the completed episode."""
+        state = self.states.get(sid)
+        if state is None:
+            return
+        previous_attempts = state.get("attempt", 0)
+        already_complete = state.get("state") == "resumed" and previous_attempts == 0
+        self.retry_due.pop(sid, None)
+        intent = self.core.reconnect_resume
+        if intent:
+            intent["strategies"].pop(sid, None)
+            if not intent["strategies"]:
+                self.core.reconnect_resume = None
+        state.update(state="resumed", attempt=0, retry_at=None, retry_delay_seconds=None,
+                     message="監控已恢復；重試已停止，次數歸零")
+        if not already_complete:
+            self.log_retry(sid, "resumed", restored_by=restored_by, previous_attempts=previous_attempts)
 
     @staticmethod
     def manual_targets(action, payload, orders=()):
@@ -140,7 +191,9 @@ class Recovery:
             intent["strategies"].pop(sid, None)
             self.retry_due.pop(sid, None)
             state = self.states.setdefault(sid, {})
-            state.update(state="manual", retry_at=None, message="使用者已接手；背景查核與自動恢復已停止")
+            state.update(state="manual", retry_at=None, retry_delay_seconds=None,
+                         message="使用者已接手；背景查核與自動恢復已停止")
+            self.log_retry(sid, "cancelled", action=action)
             c.quote_warnings.pop(sid, None)
             c.audit.emit("reconnect_manual_takeover", strategy_id=sid, action=action)
             c.store.event("reconnect_manual_takeover", state["message"], sid)
@@ -156,7 +209,8 @@ class Recovery:
         waiting = len(intent["strategies"])
         paused_ids = {s["id"] for s in c.store.strategies() if s["status"] == "paused"}
         manual = sum(sid in paused_ids and s.get("state") == "manual" for sid, s in self.states.items())
-        c.stage = f"券商已重連；{active_count} 組監控已啟用"
+        connected = "帳戶已連線" if any(s.get("origin") == "system" for s in self.states.values()) else "券商已重連"
+        c.stage = f"{connected}；{active_count} 組監控已啟用"
         if waiting:
             c.stage += f"；{waiting} 組暫停，將定期自動查核，亦可由您接手"
         if manual:
@@ -197,9 +251,10 @@ class Recovery:
         intent["strategies"].pop(sid)
         self.retry_due.pop(sid, None)
         state.update(
-            state="manual", retry_at=None, message=message,
+            state="manual", retry_at=None, retry_delay_seconds=None, message=message,
             terminal_order_id=order["id"], terminal_status=report["status"],
         )
+        self.log_retry(sid, "stopped", terminal_status=report["status"])
         with c.store.transaction():
             c.fail(sid, message)
             c.store.db.execute(
@@ -213,15 +268,97 @@ class Recovery:
         return True
 
     def snapshot(self):
-        return deepcopy(self.states)
+        result = deepcopy(self.states)
+        for row in self.core.store.strategies():
+            sid, reason = row["id"], row["reason"] or ""
+            if row["status"] != "paused":
+                continue
+            system = reason.startswith(self.SYSTEM_PREFIX) or reason == "交易處理失敗；請查核委託與帳本"
+            if system and sid not in result:
+                # The cause survives restart; permission to resume never does.
+                result[sid] = {
+                    "origin": "system", "state": "manual", "error_type": None,
+                    "message": reason, "retry_at": None, "attempt": 0,
+                }
+            elif not system and result.get(sid, {}).get("origin") == "system":
+                result.pop(sid)
+        return result
+
+    def system_error(self, saved, exc, phase="quote_evaluation"):
+        """Park only the affected monitor, retaining custody and existing resume guards."""
+        c, sid = self.core, saved["id"]
+        state = self.states.setdefault(sid, {})
+        error_type = type(exc).__name__[:80]
+        cause = "記憶體不足（MemoryError）" if isinstance(exc, MemoryError) else f"程式處理異常（{error_type}）"
+        reason = self.SYSTEM_PREFIX + cause
+        transient = isinstance(exc, (MemoryError, TimeoutError, ConnectionError))
+        selected = c.broker.selected
+        current = c.store.strategy(sid)
+        same_account = (
+            saved["status"] == "active"
+            and current["status"] == "active" and current["revision"] == saved["revision"]
+            and current["run_id"] == saved["run_id"]
+            and saved["owner"] == f"{saved['mode']}:{c.owner}"
+            and selected is not None and c.owner is not None
+        )
+        intent = c.reconnect_resume
+        if intent:
+            same_account = same_account and intent["owner"] == c.owner and intent["selected"] == selected
+        eligible = (
+            transient and same_account
+            and not c.closing and not c.fault and (saved["mode"] != "live" or c.live_armed)
+        )
+        if not eligible:
+            reason += "；已暫停，請先排除原因並核對委託與庫存"
+            if current["reason"]:
+                reason += "；原暫停原因：" + current["reason"][:400]
+        else:
+            reason += "；監控已暫停，將背景查核後恢復；既有委託不重送"
+        with c.store.transaction():
+            c.fail(sid, reason)
+            c.store.event("system_error", reason, sid)
+        self.retry_due.pop(sid, None)
+        state.clear()
+        state.update(
+            origin="system", state="manual", error_type=error_type, cause=reason,
+            message=reason, phase=phase, episode_id=uuid.uuid4().hex,
+            source_run_id=saved["run_id"], revision=saved["revision"],
+            attempt=0, retry_at=None, retry_delay_seconds=None,
+        )
+        self.log_retry(sid, "detected", automatic_recovery=eligible, source_phase=phase)
+        if not eligible and intent:
+            intent["strategies"].pop(sid, None)
+            if not intent["strategies"]:
+                c.reconnect_resume = None
+        if eligible:
+            if intent is None:
+                intent = {
+                    "owner": c.owner, "selected": deepcopy(selected),
+                    "armed": c.live_armed, "strategies": {},
+                }
+            intent["strategies"][sid] = deepcopy(saved)
+            c.reconnect_resume = intent
+            if c.broker.disconnected.is_set():
+                state["state"] = "connection_wait"
+                self.log_retry(sid, "waiting_for_connection")
+            else:
+                self.schedule_retry(sid, time.monotonic())
+                self.update_stage(intent)
+        else:
+            self.log_retry(sid, "stopped", stop_reason="automatic_recovery_ineligible")
+        c.audit.emit(
+            "strategy_system_error", strategy_id=sid, phase=phase, error_type=error_type,
+            automatic_recovery=eligible, episode_id=state["episode_id"],
+        )
 
     def retry(self, now=None):
         c = self.core
         if not c.reconnect_resume or c.broker.disconnected.is_set() or c.closing or c.fault:
             return
-        now = time.monotonic() if now is None else now
-        due = [sid for sid, deadline in self.retry_due.items() if deadline <= now]
+        observed_at = time.monotonic() if now is None else now
+        due = [sid for sid, deadline in self.retry_due.items() if deadline <= observed_at]
         if due:
+            # None preserves the real completion clock; a supplied clock is for deterministic replay.
             self.resume_reconnected(c.reconnect_resume, now, due)
 
     def inventory_query(self, symbols, evidence=None, phase="initial"):
@@ -301,6 +438,8 @@ class Recovery:
                     "daily_buy_limit": str(c.account_limit) if c.account_limit is not None else None,
                 },
                 "attempt": attempt,
+                "origin": state.get("origin", "connection"),
+                "episode_id": state.get("episode_id"),
                 "started_at": utcnow().isoformat(),
                 "retryable": True,
                 "local_before": {"position": c.store.position(sid), "orders": c.store.orders(sid)},
@@ -315,7 +454,8 @@ class Recovery:
                     "difference": None,
                 },
             }
-            state.update(state="checking", attempt=attempt, retry_at=None)
+            state.update(state="checking", attempt=attempt, retry_at=None, retry_delay_seconds=None)
+            self.log_retry(sid, "check_started", check_id=checks[sid]["id"], recovery_id=recovery_id)
         self.publish()
         results = self._resume_once(scoped, checks)
         finished_at = time.monotonic() if now is None else now
@@ -329,24 +469,33 @@ class Recovery:
                 inventory=deepcopy(check["inventory"]),
             )
             self.persist_check(check, outcome, result["message"])
-            if c.broker.disconnected.is_set():
-                state.update(state="connection_wait", retry_at=None)
-                self.retry_due.pop(sid, None)
-                continue
-            if state.get("state") == "manual":
+            if outcome != "active":
+                self.log_retry(sid, "check_failed", outcome=outcome, retryable=check["retryable"])
+            if (
+                state.get("state") == "manual" or outcome == "skipped"
+                or (outcome == "blocked" and not check["retryable"])
+            ):
                 intent["strategies"].pop(sid, None)
                 self.retry_due.pop(sid, None)
+                state.update(state="manual", retry_at=None, retry_delay_seconds=None)
+                self.log_retry(sid, "stopped", stop_reason="manual_or_ineligible")
+                continue
+            if c.broker.disconnected.is_set():
+                state.update(state="connection_wait", retry_at=None, retry_delay_seconds=None)
+                self.retry_due.pop(sid, None)
+                self.log_retry(sid, "waiting_for_connection")
                 continue
             if outcome == "blocked" and check["retryable"] and sid in intent["strategies"]:
-                delay = min(300, 60 * 2 ** min(state["attempt"] - 1, 3))
-                self.retry_due[sid] = finished_at + delay
-                state.update(state="retry_wait", retry_at=(utcnow() + timedelta(seconds=delay)).isoformat())
+                self.schedule_retry(sid, finished_at)
             else:
                 intent["strategies"].pop(sid, None)
                 self.retry_due.pop(sid, None)
-                state.update(state="resumed" if outcome == "active" else "manual", retry_at=None)
+                if outcome == "active":
+                    self.complete(sid, restored_by="automatic")
+                else:
+                    state.update(state="manual", retry_at=None, retry_delay_seconds=None)
+        c.reconnect_resume = intent if intent["strategies"] else None
         if not c.broker.disconnected.is_set():
-            c.reconnect_resume = intent if intent["strategies"] else None
             self.update_stage(intent)
         return results
 
@@ -360,7 +509,9 @@ class Recovery:
         results, ready = [], []
 
         def blocked(sid, exc, retryable=True):
-            message = "重連查核待處理：" + c.audit.redactor.text(str(exc))[:400]
+            state = self.states[sid]
+            prefix = state["cause"] + "；背景查核待處理：" if state.get("origin") == "system" else "重連查核待處理："
+            message = prefix + c.audit.redactor.text(str(exc))[:400]
             checks[sid]["retryable"] = retryable
             checks[sid]["error_type"] = type(exc).__name__
             c.fail(sid, message)
@@ -510,7 +661,8 @@ class Recovery:
                             expected_generation=checks[sid]["generation"],
                         )
                         c.store.event(
-                            "reconnect_resumed", "重連自動查核完成，恢復斷線前監控；沿用剩餘額度", sid
+                            "system_recovered" if checks[sid]["origin"] == "system" else "reconnect_resumed",
+                            "背景查核完成，恢復原監控；沿用剩餘額度", sid
                         )
                     results.append({"id": sid, "status": "active", "message": "已自動恢復監控"})
                 except Exception as exc:
@@ -526,7 +678,8 @@ class Recovery:
         else:
             count = sum(r["status"] == "active" for r in results)
             blocked_count = sum(r["status"] == "blocked" for r in results)
-            c.stage = f"券商已重連；自動恢復 {count} 組監控"
+            label = "背景查核完成" if any(check["origin"] == "system" for check in checks.values()) else "券商已重連"
+            c.stage = f"{label}；自動恢復 {count} 組監控"
             if blocked_count:
                 c.stage += f"；{blocked_count} 組需處理，請查看策略提示並開啟對帳"
             c.broker.status(phase="connected", attempt=0, retry_at=None, message=c.stage)

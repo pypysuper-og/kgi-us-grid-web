@@ -186,7 +186,73 @@ function Open-ExistingGridWorkbench([hashtable]$Existing, [string]$Runtime = '',
 function Write-SetupEvent([string]$Log, [string]$Event, [hashtable]$Fields = @{}) {
     $record = @{ at = (Get-Date).ToUniversalTime().ToString('o'); event = $Event }
     foreach ($key in $Fields.Keys) { $record[$key] = $Fields[$key] }
-    $record | ConvertTo-Json -Compress | Add-Content -LiteralPath $Log -Encoding UTF8
+    $record | ConvertTo-Json -Depth 6 -Compress | Add-Content -LiteralPath $Log -Encoding UTF8
+}
+
+function Get-GridFailureDiagnostic($Failure, [string]$File = '', $ExitCode = $null) {
+    $facts = @{ sac_cause = 'NOT_ESTABLISHED'; language_mode = [string]$ExecutionContext.SessionState.LanguageMode }
+    if ($null -ne $ExitCode) { $facts.process_exit_code = [int]$ExitCode }
+    $exception = if ($Failure) { $Failure.Exception } else { $null }
+    for ($depth = 0; $depth -lt 4 -and $exception; $depth++) {
+        if (-not $facts.error_type) { $facts.error_type = $exception.GetType().Name }
+        if ($exception.PSObject.Properties['NativeErrorCode']) { $facts.winerror = [int]$exception.NativeErrorCode }
+        if ($exception.PSObject.Properties['HResult']) { $facts.hresult = ('0x{0:X8}' -f ([long]$exception.HResult -band 0xffffffffL)) }
+        $exception = $exception.InnerException
+    }
+    if ($File) {
+        try {
+            $path = [IO.Path]::GetFullPath($File)
+            $root = $PSScriptRoot.TrimEnd('\') + '\'
+            $facts.file = if ($path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                'project/' + $path.Substring($root.Length).Replace('\', '/')
+            } else { 'external/' + [IO.Path]::GetFileName($path) }
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $stream = [IO.File]::OpenRead($path)
+                $algorithm = [Security.Cryptography.SHA256]::Create()
+                try { $facts.sha256 = ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+                finally { $algorithm.Dispose(); $stream.Dispose() }
+            }
+            $facts.file_evidence = 'selected_executable'
+        } catch { $facts.file_evidence = 'UNAVAILABLE'; $facts.file_error_type = $_.Exception.GetType().Name }
+    }
+    try {
+        $facts.sac_registry_hint = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction Stop).VerifiedAndReputablePolicyState
+    } catch { $facts.sac_registry_hint = 'UNAVAILABLE' }
+    $facts.active_policy = 'NOT_VERIFIED'
+    return $facts
+}
+
+function Write-GridFailureDiagnostic($Failure, [string]$File = '', $ExitCode = $null) {
+    $changed = $false
+    if (-not $script:SetupDiagnostic) {
+        $script:SetupDiagnostic = Get-GridFailureDiagnostic $Failure -File $File -ExitCode $ExitCode
+        $changed = $true
+    }
+    if ($null -ne $ExitCode) {
+        $script:SetupDiagnostic.process_exit_code = [int]$ExitCode
+        $changed = $true
+    }
+    if ($changed -and $script:SetupLog) {
+        try { Write-SetupEvent $script:SetupLog 'startup_diagnostic' @{ stage = $script:SetupStage; diagnostic = $script:SetupDiagnostic } } catch { }
+    }
+}
+
+function Protect-GridDiagnostic($Diagnostic) {
+    $safe = @{ sac_cause = 'NOT_ESTABLISHED'; active_policy = 'NOT_VERIFIED' }
+    foreach ($key in @('error_type', 'module', 'file_evidence', 'windows_build')) {
+        $value = [string]$Diagnostic.$key
+        if ($value -match '^[a-zA-Z0-9_.-]{1,100}$') { $safe[$key] = $value }
+    }
+    foreach ($key in @('winerror', 'errno')) {
+        $value = [string]$Diagnostic.$key
+        if ($value -match '^-?[0-9]{1,12}$') { $safe[$key] = [long]$value }
+    }
+    if ([string]$Diagnostic.hresult -match '^(?:-?[0-9]{1,12}|0x[0-9a-fA-F]{8})$') { $safe.hresult = $Diagnostic.hresult }
+    if ([string]$Diagnostic.sha256 -match '^[a-fA-F0-9]{64}$') { $safe.sha256 = [string]$Diagnostic.sha256 }
+    $file = [string]$Diagnostic.file
+    if ($file -match '^(project|python)/[a-zA-Z0-9_./ -]+$' -and $file -notmatch '\.\.') { $safe.file = $file }
+    if ([string]$Diagnostic.sac_registry_hint -match '^[012]$') { $safe.sac_registry_hint = [int]$Diagnostic.sac_registry_hint }
+    return $safe
 }
 
 function ConvertTo-NativeArgument([string]$Value) {
@@ -247,6 +313,21 @@ function Receive-SetupLine([string]$Text, [string]$Log, [string]$Stage, [switch]
     } else {
         # The checker emits an allowlisted reason, never its native SDK exception.
         try { $probe = $Text | ConvertFrom-Json } catch { return }
+        if ($probe.inventory_written -or $probe.inventory_unavailable) {
+            $written = [bool]$probe.inventory_written
+            Write-SetupEvent $Log 'native_inventory' @{ stage = $Stage; report_written = $written; scan_complete = [bool]$probe.scan_complete; known_native_inventory_complete = [bool]$probe.known_native_inventory_complete; sac_compatibility = 'NOT_TESTED'; report = $(if ($written) { '.bootstrap/windows-native-inventory.json' } else { '' }) }
+            if (-not $written) {
+                Add-SetupMessage '原生相依盤點未能寫入；請保留安裝紀錄協助查核。'
+            } elseif (-not $probe.scan_complete -and $probe.known_native_inventory_complete) {
+                Add-SetupMessage '已盤點已辨識的原生與啟動檔；其他副檔名的延伸搜尋達時間預算，詳見報告。'
+            } elseif (-not $probe.scan_complete) {
+                Add-SetupMessage '原生相依盤點有未完成項目；已保留報告，不等於安裝失敗或 SAC 驗收。'
+            }
+        }
+        if ($probe.diagnostic) {
+            $script:SetupDiagnostic = Protect-GridDiagnostic $probe.diagnostic
+            Write-SetupEvent $Log 'startup_diagnostic' @{ stage = $Stage; diagnostic = $script:SetupDiagnostic }
+        }
         $reasons = @{
             receipt_missing = '既有環境缺少安裝收據；將核對套件，保留相容的 Python。'
             receipt_invalid = '安裝收據不完整；將重新核對環境。'
@@ -268,6 +349,9 @@ function Receive-SetupLine([string]$Text, [string]$Log, [string]$Stage, [switch]
 function Invoke-SetupProcess([string]$File, [string[]]$Arguments, [string]$Log,
                              [string]$Stage, [switch]$AllowFailure, [int]$Timeout = 900,
                              [switch]$ShowOutput) {
+    $script:SetupDiagnostic = $null
+    $script:SetupExecutable = $File
+    $script:SetupStage = $Stage
     Write-SetupEvent $Log 'setup_call' @{ stage = $Stage }
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $File
@@ -318,8 +402,12 @@ function Invoke-SetupProcess([string]$File, [string[]]$Arguments, [string]$Log,
             stage = $Stage; exit_code = $code
             elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
         }
+        if ($code -ne 0) { Write-GridFailureDiagnostic $null -File $File -ExitCode $code }
         if ($code -ne 0 -and -not $AllowFailure) { throw "Setup failed at $Stage (exit $code)" }
         return $code
+    } catch {
+        Write-GridFailureDiagnostic $_ -File $File
+        throw
     } finally { $process.Dispose() }
 }
 
@@ -337,6 +425,8 @@ function Initialize-SetupProgress([switch]$NoUI) {
     $script:SetupCancelRequested = $false
     $script:SetupCanCancel = $true
     $script:SetupDetail = ''
+    $script:SetupDiagnostic = $null
+    $script:SetupExecutable = ''
 }
 
 function Close-SetupProgress {
@@ -415,6 +505,7 @@ function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$
         if ($Backend.HasExited) {
             $script:SetupDetail = "後端未完成啟動（退出碼：$($Backend.ExitCode)）。請保留紀錄並重新檢查環境。"
             Write-SetupEvent $script:SetupLog 'workbench_startup_failed' @{ exit_code = $Backend.ExitCode }
+            Write-GridFailureDiagnostic $null -File $script:SetupExecutable -ExitCode $Backend.ExitCode
             throw 'Workbench exited before readiness'
         }
         # This newly launched source supports health identity. Legacy discovery can
@@ -531,10 +622,11 @@ function Initialize-GridEnvironment([string]$Runtime = '', [switch]$NoUI, [switc
         }
         $script:SetupStage = 'environment_verify'
         Set-SetupProgress '正在驗證 Python、套件與隱藏啟動元件；不會登入券商。' -NoUI:$NoUI
-        $null = Invoke-SetupProcess $python @('-X', 'utf8', $checker, '--verify', '--write-marker') $log $script:SetupStage -Timeout 120
+        $null = Invoke-SetupProcess $python @('-X', 'utf8', $checker, '--verify', '--write-marker', '--uv-path', $UvPath) $log $script:SetupStage -Timeout 180
         Write-SetupEvent $log 'environment_ready' @{ installed = $needsSync; reused_python = $reusedPython }
         return Join-Path $PSScriptRoot '.venv\Scripts\pythonw.exe'
     } catch {
+        Write-GridFailureDiagnostic $_ -File $script:SetupExecutable
         if (-not $script:SetupDetail) { $script:SetupDetail = Protect-SetupOutput $_.Exception.Message }
         Write-SetupEvent $log 'bootstrap_failed' @{ stage = $script:SetupStage; error_type = $_.Exception.GetType().Name; message = $script:SetupDetail }
         throw
@@ -550,7 +642,16 @@ function Show-SetupFailure([switch]$NoUI) {
     if ($script:SetupStage -eq 'open_existing') {
         $message = "$script:SetupDetail`n既有程序、登入與交易監控仍保持運行。`n紀錄：$script:SetupLog"
     }
+    if ($script:SetupDiagnostic) {
+        $facts = $script:SetupDiagnostic
+        $message += "`n相關程式檔：$($facts.file)`nSHA-256：$($facts.sha256)`nWindows 錯誤碼：$($facts.winerror)；HRESULT：$($facts.hresult)；程序退出碼：$($facts.process_exit_code)`n請保留原生相依盤點 .bootstrap/windows-native-inventory.json。原因仍需核對事件，尚未確認是 SAC 阻擋。"
+    }
     if ($NoUI) { Write-Host $message; return }
-    Add-Type -AssemblyName System.Windows.Forms
-    [Windows.Forms.MessageBox]::Show($message, '美股網格工作台', 'OK', 'Error') | Out-Null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show($message, '美股網格工作台', 'OK', 'Error') | Out-Null
+    } catch {
+        Write-Host $message
+        try { (New-Object -ComObject WScript.Shell).Popup($message, 0, '美股網格工作台', 16) | Out-Null } catch { }
+    }
 }

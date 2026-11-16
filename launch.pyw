@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 
+
 def bootstrap(event, **fields):
     directory = Path(
         os.environ.get(
@@ -73,6 +74,12 @@ def main():
             cleanup_confirmed = exc.cleanup_confirmed
         elif isinstance(exc, SystemExit) and isinstance(exc.code, int):
             detail["server_exit_code"] = exc.code
+        try:
+            from tools.windows_support import failure_details
+            diagnostic = failure_details(exc, project=Path(__file__).resolve().parent)
+        except Exception:
+            diagnostic = {"error_type": type(exc).__name__, "sac_cause": "NOT_ESTABLISHED",
+                          "file_evidence": "DIAGNOSTICS_UNAVAILABLE"}
         # A dismissed error dialog is not part of DB/SDK custody. Release only
         # after the server attests to cleanup, before showing this modal dialog.
         if cleanup_confirmed and environment_guard:
@@ -84,6 +91,7 @@ def main():
                 error_type=type(exc).__name__,
                 detail=detail,
                 cleanup_confirmed=cleanup_confirmed,
+                diagnostic=diagnostic,
             )
         finally:
             if "--no-browser" not in sys.argv:
@@ -107,7 +115,10 @@ def main():
                 ctypes.windll.user32.MessageBoxW(
                     None,
                     f"{reason}\n階段：{detail['stage']}；原因：{detail['reason']}。\n"
-                    f"{cleanup}\n請查看 logs/bootstrap.jsonl 與 runtime/logs 稽核紀錄。",
+                    f"{cleanup}\nWindows 錯誤碼：{diagnostic.get('winerror', '未提供')}；"
+                    f"檔案：{diagnostic.get('file', '未能定位')}。\n"
+                    "請保留 logs/bootstrap.jsonl 與 .bootstrap/windows-native-inventory.json；"
+                    "錯誤原因仍需核對，不代表已確認是 SAC 阻擋。",
                     "美股網格工作台",
                     0x10,
                 )

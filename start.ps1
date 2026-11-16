@@ -6,6 +6,14 @@
     [string]$UvPath = ''
 )
 $ErrorActionPreference = 'Stop'
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    $message = 'PowerShell 正處於受限語言模式，工作台無法準備環境。請保留 .bootstrap/startup-failure.json 並核對 Windows 應用程式控制事件；不要關閉防護。'
+    New-Item -ItemType Directory -Path (Join-Path $PSScriptRoot '.bootstrap') -Force | Out-Null
+    @{ event = 'startup_diagnostic'; stage = 'script_host'; language_mode = "$($ExecutionContext.SessionState.LanguageMode)"; sac_cause = 'NOT_ESTABLISHED' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PSScriptRoot '.bootstrap/startup-failure.json') -Encoding UTF8
+    Write-Host $message
+    if (-not $NoBrowser) { try { (New-Object -ComObject WScript.Shell).Popup($message, 0, '美股網格工作台', 16) | Out-Null } catch { } }
+    exit 1
+}
 Set-Location -LiteralPath $PSScriptRoot
 . (Join-Path $PSScriptRoot 'bootstrap.ps1')
 $backend = $null
@@ -29,6 +37,7 @@ try {
     $pythonWindowless = Initialize-GridEnvironment -Runtime $Runtime -NoUI:$NoBrowser -UvPath $UvPath -KeepProgress
     $script:SetupStage = 'launch_windowless'
     $entryScript = Join-Path $PSScriptRoot 'launch.pyw'
+    $script:SetupExecutable = $pythonWindowless
     if (-not (Test-Path -LiteralPath $pythonWindowless)) { throw 'Windowless Python missing' }
     # The desktop host owns its native window; this launcher opens the optional browser.
     $launchArguments = @('-X', 'utf8', $entryScript, '--port', [string]$Port, '--launcher')
@@ -55,6 +64,7 @@ try {
         }
     }
 } catch {
+    Write-GridFailureDiagnostic $_ -File $script:SetupExecutable
     if ($script:SetupStage -in @('environment_lock', 'runtime_lock')) {
         # Another launch may have become ready after the first read-only probe.
         $existing = Find-ExistingGridWorkbench -Port $Port -Runtime $Runtime

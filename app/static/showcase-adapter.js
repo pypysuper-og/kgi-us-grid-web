@@ -39,7 +39,7 @@
   const path=new URL(String(url),location.href).pathname;
   try{
    let data;
-   if(path==="/api/session")data={token:"showcase-only",instance:"showcase",version:"0.1.14"};
+   if(path==="/api/session")data={token:"showcase-only",instance:"showcase",version:"0.1.16"};
    else if(path==="/api/state")data=snapshot();
    else if(path==="/api/diagnostics")data=diagnostics();
    else if(path.startsWith("/api/commands/")&&options.method==="POST"){

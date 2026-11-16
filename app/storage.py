@@ -314,7 +314,9 @@ class Store:
     def recover(self):
         with self.transaction():
             self.db.execute(
-                "UPDATE strategies SET status='paused',reconciled=0,reason='重啟後請對帳' WHERE status!='archived'"
+                "UPDATE strategies SET status='paused',reconciled=0,reason=CASE "
+                "WHEN reason LIKE '系統異常：%' OR reason='交易處理失敗；請查核委託與帳本' "
+                "THEN reason ELSE '重啟後請對帳' END WHERE status!='archived'"
             )
             self.db.execute(
                 "UPDATE orders SET unknown=1 WHERE status NOT IN ('filled','canceled','rejected','expired')"

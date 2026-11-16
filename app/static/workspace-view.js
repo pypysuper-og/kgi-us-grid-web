@@ -34,6 +34,7 @@ const WorkspaceView = (() => {
   return {low:low/100,high:high/100,anchor:base/100,gap:gap/100,inventory:held,quantity,next,levels,levelCount:count,sampled:count>64,boundaryAligned:(base-low)%gap===0&&(high-base)%gap===0,rows};
  }
  function pendingOrders(s,state) {return (state.orders||[]).filter(o=>o.strategy_id===s.id&&(!terminal.has(o.status)||o.unknown));}
+ function systemStatus(s,state) {const recovery=state.recovery_status?.[s.id];return s.status==="paused"&&recovery?.origin==="system"?recovery:null;}
  function displayQuote(s,state) {
   if(s.mode==="demo") {const q=state.quotes?.[s.id];return q?{...q,kind:"demo",label:"離線行情"}:null;}
   if(!state.owner||s.owner!==`${s.mode}:${state.owner}`)return null;
@@ -43,17 +44,28 @@ const WorkspaceView = (() => {
  function describeStrategy(s,state,now=Date.now(),backendLost=false) {
   const p=s.params,position=(state.report?.rows||[]).find(r=>r.strategy_id===s.id),grid=gridModel(p,s.anchor,position?.quantity??p.initial_inventory);
   const pending=pendingOrders(s,state),engine=state.quotes?.[s.id];
-  const result=(code,title,detail="",tone="neutral")=>({code,title,detail,tone,grid});
+  const recoveryState=state.recovery_status?.[s.id];
+  const result=(code,title,detail="",tone="neutral")=>({code,title,detail:recoveryState?.origin==="system"?`${detail}${detail?" ":""}本次重試 ${recoveryState.attempt??0} 次。`:detail,tone,grid});
   if(backendLost)return result("backend_lost","引擎無回應，策略狀態待確認","最後顯示的狀態僅供參考，請確認引擎狀態。","warning");
   if(s.status==="archived")return result("archived","策略已封存");
   if(state.fault||state.audit_error)return result("fault","交易服務需處理",state.fault||state.audit_error,"warning");
-  if(pending.some(o=>o.unknown))return result("unknown_order","委託結果待查核","保留原單；確認券商結果前不建立新網格單。","warning");
+  const system=systemStatus(s,state),cause=system?(s.reason?.startsWith("系統異常：")?s.reason.split("；")[0]:"系統異常：歷史處理失敗（原因未記錄）"):"";
+  if(pending.some(o=>o.unknown))return result("unknown_order","委託結果待查核",`${cause?cause+"；":""}保留原單；確認券商結果前不建立新網格單。`,"warning");
   if(pending.length) {
    const o=pending[0],remaining=Math.max(0,o.quantity-o.filled);
-   return result("pending_order",s.status==="active"?"委託尚未結束，等待回報":"已停止新單，仍有在途委託",`${o.side==="buy"?"買進":"賣出"} ${o.quantity} 股，已成交 ${o.filled} 股，剩餘 ${remaining} 股；限價 USD ${money(o.price)}。`,"waiting");
+   return result("pending_order",s.status==="active"?"委託尚未結束，等待回報":"已停止新單，仍有在途委託",`${cause?cause+"；":""}${o.side==="buy"?"買進":"賣出"} ${o.quantity} 股，已成交 ${o.filled} 股，剩餘 ${remaining} 股；限價 USD ${money(o.price)}。`,"waiting");
   }
   if(s.status!=="active") {
    const recovery=state.recovery_status?.[s.id];
+   if(system){
+    const inventory=system.inventory,difference=inventory?.difference!=null?` 券商 ${inventory.broker_quantity} 股，預期 ${inventory.expected_quantity} 股，差額 ${inventory.difference} 股。`:"";
+    let detail="自動恢復已停止；請先排除系統原因，再核對委託與庫存後啟動。";
+    if(system.state==="checking")detail="監控已暫停，正在背景查核委託與庫存；通過後才恢復原監控。";
+    else if(system.state==="retry_wait")detail=`監控已暫停；${system.retry_at?`下次 ${new Date(system.retry_at).toLocaleString("zh-TW",{hour12:false})} 自動查核。`:"等待背景查核。"}查核通過後才恢復原監控，既有委託不重送。`;
+    else if(system.state==="connection_wait")detail="監控已暫停，等待券商重連後查核；既有委託不重送。";
+    const blocked=s.reason?.split("背景查核待處理：")[1];
+    return result("system_error",cause,detail+difference+(blocked?` 上次查核：${blocked}`:""),"warning");
+   }
    if(recovery?.state==="checking")return result("recovering","監控已暫停，正在背景查核",`查核完成前尚未恢復監控。${s.reason?`上次查核：${s.reason}`:""}`,"waiting");
    if(recovery?.state==="retry_wait")return result("recovery_wait","等待下一次自動查核",`${s.reason||recovery.message||""} 第 ${recovery.attempt} 次查核未通過；${recovery.retry_at?`下次 ${new Date(recovery.retry_at).toLocaleString("zh-TW",{hour12:false})} 自動查核；`:""}差異排除後自動恢復。`,"waiting");
    if(recovery?.state==="connection_wait")return result("recovery_connection","等待券商重連後查核",s.reason||"","waiting");
@@ -128,6 +140,7 @@ const WorkspaceView = (() => {
    let action="",reason="",title=s.params.name;
    if(pending.some(o=>o.unknown)){action="reconcile";reason="委託結果未明，請查核原單與庫存";}
    else if(["checking","retry_wait","connection_wait"].includes(recovery?.state))continue;
+   else if(systemStatus(s,state)){action="system";const d=describeStrategy(s,state);reason=d.title+"；"+d.detail;}
    else if(!s.reconciled){action="reconcile";reason=s.reason||"尚未完成庫存與委託核對";}
    else if(s.status==="active"){
     const d=describeStrategy(s,state);
@@ -140,6 +153,6 @@ const WorkspaceView = (() => {
   return items;
  }
  function pollingDelays(hidden,loginBusy,diagnosticOpen){return hidden?{state:5000,diagnostics:5000}:{state:1200,diagnostics:loginBusy||diagnosticOpen?500:3000};}
- return {gridModel,pendingOrders,displayQuote,describeStrategy,setText,summaryNode,updateSummary,drawGrid,attentionItems,pollingDelays};
+ return {gridModel,pendingOrders,systemStatus,displayQuote,describeStrategy,setText,summaryNode,updateSummary,drawGrid,attentionItems,pollingDelays};
 })();
 if(typeof module!=="undefined")module.exports=WorkspaceView;
