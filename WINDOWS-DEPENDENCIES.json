@@ -9,7 +9,7 @@
     {
       "file": "bootstrap.ps1",
       "kind": "SCRIPT_HOST",
-      "sha256": "969fd828ef63fa623423f66a4d8eecb8af689988e54f78a73604a8ccdf0a950c",
+      "sha256": "ea9fc4c6975547ede43220ac0c19921d0c22716a49182052d55ae031fd1b0045",
       "signature_status": "NOT_INSPECTED_IN_MANIFEST"
     },
     {
@@ -27,7 +27,7 @@
     {
       "file": "start.ps1",
       "kind": "SCRIPT_HOST",
-      "sha256": "09bfbacc26f0d1fe248ee57bb256a2ba554769031b2e44a4704c49438222e515",
+      "sha256": "909df94453ab39fa1789c6192bfa90f8dd42d31b4319e55586e8eb3d588bfdcd",
       "signature_status": "NOT_INSPECTED_IN_MANIFEST"
     },
     {
@@ -89,7 +89,7 @@
     "jedi": "0.20.0",
     "jinja2": "3.1.6",
     "kaleido": "0.1.0",
-    "kgi-us-grid-web": "0.1.16",
+    "kgi-us-grid-web": "0.1.17",
     "kgisuperpy": "2.1.2",
     "kiwisolver": "1.5.1",
     "korean-lunar-calendar": "0.4.0",
@@ -155,5 +155,5 @@
   "sac_compatibility": "NOT_TESTED",
   "schema_version": 1,
   "scope": "SOURCE_PACKAGE",
-  "version": "0.1.16"
+  "version": "0.1.17"
 }

@@ -6,10 +6,12 @@ import socket
 import threading
 import time
 import webbrowser
+import uuid
 
 import uvicorn
 from app.server import create_app
 from app.desktop import DesktopHost, saved_presentation_mode, webview2_version
+from app.tauri_host import TauriHost, executable_path
 
 
 class ServerFailure(RuntimeError):
@@ -64,13 +66,20 @@ class WorkbenchServer(uvicorn.Server):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=0, help="0 selects an available loopback port")
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--browser", action="store_true", help="Use the optional browser UI")
+    parser.add_argument("--desktop-engine", choices=("tauri", "pywebview"), default="tauri")
     parser.add_argument("--launcher", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--launch-id", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
+    if args.launch_id is not None and (len(args.launch_id) != 32 or any(c not in "0123456789abcdef" for c in args.launch_id)):
+        parser.error("invalid launch identity")
     app = create_app(args.runtime)
+    app.state.launch_id = args.launch_id or uuid.uuid4().hex
     presentation = "browser" if args.browser or args.no_browser else saved_presentation_mode(app.state.service.path)
     app.state.presentation_mode = presentation
     server = WorkbenchServer(
@@ -92,11 +101,14 @@ def main():
         if presentation == "desktop":
             stage = "desktop_engine"
             webview2_version()
+            if args.desktop_engine == "tauri":
+                executable_path()
         stage = "listen"
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         sock.bind(("127.0.0.1", args.port))
         sock.listen(128)
+        app.state.listen_port = sock.getsockname()[1]
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
         print(f"US Grid Workbench: {url}", flush=True)
 
@@ -114,7 +126,7 @@ def main():
 
         if presentation == "browser" and not args.no_browser and not args.launcher:
             threading.Thread(target=open_browser, daemon=True).start()
-        app.state.service.audit.emit("server_starting", host="127.0.0.1", port=args.port)
+        app.state.service.audit.emit("server_starting", host="127.0.0.1", port=app.state.listen_port, requested_port=args.port)
         stage = "server_startup"
         if presentation == "desktop":
             failure = []
@@ -138,7 +150,8 @@ def main():
                     raise failure[0]
                 if not server.started:
                     raise RuntimeError("後端未完成啟動")
-                DesktopHost(app, finished).run(url)
+                host_type = TauriHost if args.desktop_engine == "tauri" else DesktopHost
+                host_type(app, finished).run(url)
             finally:
                 server.should_exit = True
                 worker.join(15)
@@ -158,7 +171,7 @@ def main():
     except BaseException as exc:
         service = app.state.service
         detail = dict(service.startup_failure or {"stage": stage, "reason": "server_error"})
-        if isinstance(exc, ValueError) and str(exc) in {"webview2_runtime_missing", "desktop_requires_windows"}:
+        if isinstance(exc, ValueError) and str(exc) in {"webview2_runtime_missing", "desktop_requires_windows", "tauri_desktop_missing"}:
             detail["reason"] = str(exc)
         detail["error_type"] = type(exc).__name__ if "error_type" not in detail else detail["error_type"]
         if isinstance(exc, SystemExit) and isinstance(exc.code, int):

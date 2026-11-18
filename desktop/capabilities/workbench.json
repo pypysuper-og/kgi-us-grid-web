@@ -1,0 +1,8 @@
+{
+  "identifier": "workbench",
+  "description": "Only acknowledge a completed shutdown from the local workbench.",
+  "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:*"] },
+  "local": false,
+  "permissions": ["allow-close-completed-window"]
+}

@@ -2,9 +2,10 @@
 (function(root,factory){const api=factory();if(typeof module==="object"&&module.exports)module.exports=api;else root.Showcase=api;})(globalThis,function(){
  "use strict";
  const DURATION=88;
- const PLAYBACK_RATE=0.5,PLAYBACK_DURATION=DURATION/PLAYBACK_RATE;
- const toStoryTime=seconds=>Math.max(0,Math.min(PLAYBACK_DURATION,Number.isFinite(seconds)?seconds:0))*PLAYBACK_RATE;
- const toPlaybackTime=seconds=>Math.max(0,Math.min(DURATION,Number.isFinite(seconds)?seconds:0))/PLAYBACK_RATE;
+ const PLAYBACK_RATES=Object.freeze([0.5,0.8,1]);
+ const PLAYBACK_RATE=PLAYBACK_RATES[0],PLAYBACK_DURATION=DURATION/PLAYBACK_RATE;
+ const toStoryTime=(seconds,rate=PLAYBACK_RATE)=>Math.max(0,Math.min(DURATION,(Number.isFinite(seconds)?seconds:0)*rate));
+ const toPlaybackTime=(seconds,rate=PLAYBACK_RATE)=>Math.max(0,Math.min(DURATION,Number.isFinite(seconds)?seconds:0))/rate;
  const quotes=[[0,100],[40,100],[42,99.4],[44,98.8],[46,98],[48,97.9],[50,98.7],[53,99.5],[55,100],[57,100.1],[60,99.3],[62,98.4],[64,98],[66,97.8],[68,98.5],[70,99.3],[72,100],[74,100.2],[76,101],[78,100.4],[80,100]];
  const orders=[
   {id:"DEMO-B01",side:"buy",price:98,quantity:10,submitted:46,filled:48},
@@ -31,7 +32,7 @@
   [66,"market","第二次買入，重新持有 10 股","模擬成交回報更新部位與成本；網格基準也跟著這次全部成交推進。"],
   [72,"market","價格反彈，第二次賣出","示範行情回到 100 美元，播放第二筆賣出委託，接著等待模擬成交回報。"],
   [74,"market","第二次賣出完成，部位歸零","兩次循環、四筆模擬成交完成，展示累計價差 40 美元。這是預先編排的數字，不是實際績效。"],
-  [84,"complete","05　完整流程，半速回顧","已演示登入、建立實單網格、開啟監控，以及價格驅動的兩次進出場。可重播，或返回原本工作台；沒有建立或操作任何真實策略。"]
+  [84,"complete","05　完整流程回顧","已演示登入、建立實單網格、開啟監控，以及價格驅動的兩次進出場。可重播，或返回原本工作台；沒有建立或操作任何真實策略。"]
  ];
  function snapshot(seconds){
   const elapsed=Number.isFinite(seconds)?Math.max(0,Math.min(DURATION,seconds)):0;
@@ -46,6 +47,6 @@
   }
   return {elapsed,finished:elapsed>=DURATION,phase:cue[1],cue,price:visibleQuotes.at(-1)[1],quotes:visibleQuotes,orders:visibleOrders,quantity,cost:cost/100,realized:realized/100,anchor,cycles,nextBuy:anchor-2,nextSell:quantity?anchor+2:null,connected:elapsed>=8,created:elapsed>=26,armed:elapsed>=31,checked:elapsed>=34,monitoring:elapsed>=37};
  }
- return {DURATION,PLAYBACK_RATE,PLAYBACK_DURATION,toStoryTime,toPlaybackTime,quotes,orders,cues,snapshot};
+ return {DURATION,PLAYBACK_RATES,PLAYBACK_RATE,PLAYBACK_DURATION,toStoryTime,toPlaybackTime,quotes,orders,cues,snapshot};
 });
 

@@ -94,15 +94,41 @@ public static class GridStartupTcpOwner {
     return [GridStartupTcpOwner]::LoopbackListeners($Port)
 }
 
-function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '') {
+function Read-GridEndpoint([string]$Runtime) {
+    try {
+        $path = Join-Path (Get-GridRuntime $Runtime) 'endpoint.json'
+        if (-not (Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -gt 4096) { return $null }
+        $endpoint = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($endpoint.product -ne 'kgi-us-grid-web' -or $endpoint.protocol -ne 1 -or
+            $endpoint.runtime_id -ne (Get-GridRuntimeId $Runtime) -or
+            [string]$endpoint.instance -notmatch '^[a-f0-9]{32}$' -or
+            [int]$endpoint.pid -le 0 -or [int]$endpoint.port -lt 1 -or [int]$endpoint.port -gt 65535) { return $null }
+        return $endpoint
+    } catch { return $null }
+}
+
+function Find-ExistingGridWorkbench([int]$Port, [string]$Runtime = '', [object]$Expected = $null) {
+    if ($Port -eq 0) {
+        $endpoint = Read-GridEndpoint $Runtime
+        if ($endpoint) {
+            $existing = Find-ExistingGridWorkbench -Port ([int]$endpoint.port) -Runtime $Runtime -Expected $endpoint
+            if ($existing) { return $existing }
+        }
+        # Allow the user's already-running fixed-port release to finish normally.
+        return Find-ExistingGridWorkbench -Port 8765 -Runtime $Runtime
+    }
     $url = "http://127.0.0.1:$Port/"
     try {
         $healthText = Invoke-GridStartupProbe ($url + 'api/health')
         $health = if ($healthText) { $healthText | ConvertFrom-Json } else { $null }
         if ($health -and $health.product) {
             # A modern identity mismatch is conclusive; do not downgrade to legacy matching.
-            return Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
+            $existing = Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
+            if ($Expected -and (-not $existing -or $existing.instance -ne $Expected.instance -or
+                $existing.backend_pid -ne [int]$Expected.pid)) { return $null }
+            return $existing
         }
+        if ($Expected) { return $null }
         # Older running releases cannot acquire a new endpoint without a restart.
         # Bind their HTTP surface to this launch.pyw and the selected runtime's
         # own startup record, including process creation time to reject stale PIDs.
@@ -491,7 +517,7 @@ function Set-SetupProgress([string]$Text, [switch]$NoUI) {
 }
 
 function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$Backend,
-                            [int]$Timeout = 180) {
+                             [int]$Timeout = 180, [string]$LaunchId = '') {
     $script:SetupStage = 'server_startup'
     $script:SetupCanCancel = $false
     if ($script:SetupCancel) { $script:SetupCancel.Text = '隱藏提示' }
@@ -510,20 +536,36 @@ function Wait-GridWorkbench([int]$Port, [string]$Runtime, [Diagnostics.Process]$
         }
         # This newly launched source supports health identity. Legacy discovery can
         # fall through to slow CIM initialization while the new server becomes ready.
-        $healthText = Invoke-GridStartupProbe "http://127.0.0.1:$Port/api/health"
+        $currentPort = $Port
+        $endpoint = $null
+        if ($Port -eq 0 -or $LaunchId) {
+            $endpoint = Read-GridEndpoint $Runtime
+            # Windows venv redirectors have a different PID from the interpreter.
+            # Bind this launch by its nonce, then validate the engine's own identity.
+            if (-not $endpoint -or ($LaunchId -and $endpoint.launch_id -ne $LaunchId) -or
+                ($Port -ne 0 -and [int]$endpoint.port -ne $Port)) {
+                [Threading.Thread]::Sleep(200)
+                continue
+            }
+            $currentPort = [int]$endpoint.port
+        }
+        $healthText = Invoke-GridStartupProbe "http://127.0.0.1:$currentPort/api/health"
         $health = $null
         if ($healthText) { try { $health = $healthText | ConvertFrom-Json } catch { } }
-        $ready = Get-GridHealthWorkbench -Health $health -Port $Port -Runtime $Runtime
-        if ($ready -and ($ready.presentation_mode -ne 'desktop' -or $ready.desktop_ready)) {
+        $ready = Get-GridHealthWorkbench -Health $health -Port $currentPort -Runtime $Runtime
+        if ($ready -and (-not $endpoint -or ($ready.instance -eq $endpoint.instance -and $ready.backend_pid -eq [int]$endpoint.pid)) -and
+            ($ready.presentation_mode -ne 'desktop' -or $ready.desktop_ready)) {
             Write-SetupEvent $script:SetupLog 'workbench_ready' @{
-                backend_pid = $ready.backend_pid; port = $Port
+                backend_pid = $ready.backend_pid; port = $currentPort
                 elapsed_seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
             }
             return $ready
         }
         [Threading.Thread]::Sleep(200)
     }
-    $script:SetupDetail = "啟動等待超過 $Timeout 秒；背景程序狀態尚未確認，沒有重啟或強制停止。請查看紀錄，勿刪除鎖檔。若稍後完成，可開啟 http://127.0.0.1:$Port/。"
+    $hint = '若稍後完成，可重新執行 start 喚回既有工作台。'
+    if ($currentPort -gt 0) { $hint = "若稍後完成，可開啟 http://127.0.0.1:$currentPort/。" }
+    $script:SetupDetail = "啟動等待超過 $Timeout 秒；背景程序狀態尚未確認，沒有重啟或強制停止。請查看紀錄，勿刪除鎖檔。$hint"
     Write-SetupEvent $script:SetupLog 'workbench_startup_timeout' @{ timeout_seconds = $Timeout; port = $Port }
     throw 'Workbench readiness timeout'
 }

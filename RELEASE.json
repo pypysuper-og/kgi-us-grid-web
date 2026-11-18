@@ -1,10 +1,9 @@
 {
   "name": "kgi-us-grid-web",
-  "version": "0.1.16",
-  "source_commit": "0f353684095a1b3774580c338dace219324f48a1",
-  "source_modified": false,
-  "content_fingerprint": "79c14af15a78268673bc17780cac209945cc674816a4edadd6b280200fd95b59",
+  "version": "0.1.17",
+  "content_fingerprint": "a0b405ee8e9be85551090fe0f4836e756993e5a2d3618b7c415c79b08f45dd17",
   "type": "source",
   "sdk": "2.1.2",
-  "python": "3.12-x64"
+  "python": "3.12-x64",
+  "desktop": "Tauri/WebView2"
 }

@@ -1,0 +1,23 @@
+[package]
+name = "us-grid-desktop"
+version = "0.1.17"
+edition = "2024"
+description = "WebView2 desktop host for the US grid workbench"
+license = "MIT"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = "=2.7.5"
+
+[dependencies]
+tauri = "=2.12.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "=0.15.4"
+
+[profile.release]
+strip = true
+

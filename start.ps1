@@ -1,5 +1,5 @@
 ﻿param(
-    [int]$Port = 8765,
+    [ValidateRange(0, 65535)][int]$Port = 0,
     [string]$Runtime = '',
     [switch]$NoBrowser,
     [switch]$Browser,
@@ -40,14 +40,16 @@ try {
     $script:SetupExecutable = $pythonWindowless
     if (-not (Test-Path -LiteralPath $pythonWindowless)) { throw 'Windowless Python missing' }
     # The desktop host owns its native window; this launcher opens the optional browser.
-    $launchArguments = @('-X', 'utf8', $entryScript, '--port', [string]$Port, '--launcher')
+    $launchId = [guid]::NewGuid().ToString('N')
+    $launchArguments = @('-X', 'utf8', $entryScript, '--port', [string]$Port, '--launcher', '--launch-id', $launchId)
     if ($NoBrowser) { $launchArguments += '--no-browser' }
     if ($Browser) { $launchArguments += '--browser' }
     if ($Runtime) { $launchArguments += @('--runtime', $Runtime) }
     $quoted = ($launchArguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
     $backend = Start-Process -FilePath $pythonWindowless -ArgumentList $quoted -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
     if (-not $NoBrowser) {
-        $ready = Wait-GridWorkbench -Port $Port -Runtime $Runtime -Backend $backend
+        $ready = Wait-GridWorkbench -Port $Port -Runtime $Runtime -Backend $backend -LaunchId $launchId
+        $Port = ([uri]$ready.url).Port
         if ($ready.presentation_mode -eq 'desktop') {
             Set-SetupProgress '桌面工作台已就緒。'
             Write-SetupEvent $script:SetupLog 'workbench_desktop_opened' @{ port = $Port; backend_pid = $ready.backend_pid }

@@ -276,7 +276,7 @@ window.requestDesktopClose=requestWorkbenchExit;
 window.completeDesktopShutdown=orders=>{
  closed=true;shutdownPending=false;document.querySelectorAll("dialog[open]").forEach(d=>d.close());$("shutdown-screen").hidden=false;showShutdownOrders(orders);
  document.querySelector(".shutdown-symbol").textContent="✓";$("shutdown-title").textContent="程式已結束，仍有委託需查核";$("shutdown-message").textContent="券商已登出，背景與帳本已完成收尾。請先記下下方委託，再關閉視窗。";$("shutdown-detail").textContent="程式結束不代表委託已撤銷；請至券商確認。";$("shutdown-back").hidden=true;
- const close=button("我已記下待查核委託，關閉視窗",()=>window.pywebview.api.close_completed_window(),"primary");close.id="desktop-final-close";if(!$("desktop-final-close"))$("shutdown-orders").after(close);
+ const close=button("我已記下待查核委託，關閉視窗",()=>window.gridDesktop?window.gridDesktop.closeCompletedWindow():window.pywebview.api.close_completed_window(),"primary");close.id="desktop-final-close";if(!$("desktop-final-close"))$("shutdown-orders").after(close);
 };
 $("shutdown-open").addEventListener("click",requestWorkbenchExit);
 $("shutdown-back").addEventListener("click",()=>{$("shutdown-screen").hidden=true;closed=false;refresh();});

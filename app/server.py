@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .service import Service
+from .endpoint import publish_endpoint
 
 STATIC = Path(__file__).parent / "static"
 
@@ -26,7 +27,6 @@ def showcase_document():
     page = re.sub(r'<script src="/static/showcase-player\.js" defer></script>', '', page)
     page = page.replace('/static/', '/showcase/assets/')
     page = page.replace('</head>', '<link rel="stylesheet" href="/showcase/assets/showcase.css">'
-                        '<script src="/showcase/assets/showcase.js" defer></script>'
                         '<script src="/showcase/assets/showcase-adapter.js" defer></script></head>')
     return page.replace('</body>', '<script src="/showcase/assets/showcase-ui.js" defer></script></body>')
 
@@ -139,6 +139,13 @@ def create_app(path=None, service_factory=Service):
         guard.acquire()
         try:
             service.start()
+            if app.state.listen_port:
+                publish_endpoint(directory, {
+                    "product": "kgi-us-grid-web", "protocol": 1,
+                    "instance": instance, "pid": os.getpid(),
+                    "runtime_id": runtime_identity(directory), "port": app.state.listen_port,
+                    "launch_id": app.state.launch_id,
+                })
             yield
         finally:
             try:
@@ -157,6 +164,8 @@ def create_app(path=None, service_factory=Service):
     app.state.activate_callback = None
     app.state.presentation_mode = "browser"
     app.state.desktop_ready = False
+    app.state.listen_port = None
+    app.state.launch_id = None
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next):
@@ -218,7 +227,7 @@ def create_app(path=None, service_factory=Service):
 
     @app.get("/api/session")
     def session():
-        return {"token": token, "instance": instance, "version": "0.1.16"}
+        return {"token": token, "instance": instance, "version": "0.1.17"}
 
     @app.get("/api/health")
     def health():
@@ -227,7 +236,7 @@ def create_app(path=None, service_factory=Service):
             "product": "kgi-us-grid-web",
             "protocol": 1,
             "instance": instance,
-            "version": "0.1.16",
+            "version": "0.1.17",
             "pid": os.getpid(),
             "runtime_id": runtime_identity(directory),
             "ready": service.thread.is_alive() and not service.stop_event.is_set() and service.error is None,
