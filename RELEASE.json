@@ -1,7 +1,7 @@
 {
   "name": "kgi-us-grid-web",
   "version": "0.1.17",
-  "content_fingerprint": "a0b405ee8e9be85551090fe0f4836e756993e5a2d3618b7c415c79b08f45dd17",
+  "content_fingerprint": "8bbb2f8d2cc875b4076ff30345d3fdcab092a48a6acc1fd08d41ce33969de52a",
   "type": "source",
   "sdk": "2.1.2",
   "python": "3.12-x64",
